@@ -1,0 +1,9 @@
+career:
+  - "./data/career/*.txt"
+
+incident:
+  - "./data/incidents/*.txt"
+
+general:
+  - "./data/general/*"
+

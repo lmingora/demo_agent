@@ -1,0 +1,41 @@
+llm_defaults:
+  provider: ollama
+  model: mistral:instruct
+  temperature: 0.1
+
+embeddings:
+  provider: ollama
+  model: mxbai-embed-large
+
+paths:
+  cache_dir: cache
+  data_dir: data
+  log_dir: cache/logs
+
+vectorstore:
+  provider: chroma
+  collection: "kb_main"
+  persist_directory: "cache/chroma"
+
+retrieval:
+  k: 8
+  ensemble_weights: [0.5, 0.5]   # [BM25, Vector]
+  compression: false
+  chunk_size: 1200               # ✅ agregado
+  overlap: 200                   # ✅ agregado
+
+bm25:
+  store_dir: "cache/bm25"        # ✅ agregado
+
+features:
+  use_langgraph_supervisor: true
+  use_checkpointer_sqlite: true
+  sqlite_checkpoint_path: "cache/checkpoints.sqlite3"
+
+runtime:
+  log_level: INFO
+
+router:
+  keywords:
+    incident: ["outage", "incident", "incidente", "caída", "downtime", "rca", "root cause", "sev", "postmortem"]
+    career:   ["feedback", "desempeño", "performance", "objetivos", "okr", "okrs", "360", "promoción", "ascenso"]

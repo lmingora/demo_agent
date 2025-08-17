@@ -1,0 +1,17 @@
+.venv/
+cache/
+bin/
+dist/
+build/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.log
+.DS_Store
+cache/chroma/
+cache/bm25/
+vectorstores/
+test/
+.cache
+data/
+tools/

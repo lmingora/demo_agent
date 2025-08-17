@@ -1,0 +1,5 @@
+[
+  {"q": "Necesito feedback 360 de mi desempeño", "expected": "career"},
+  {"q": "¿Qué pasó con el outage de mayo 2024?", "expected": "incident"},
+  {"q": "¿Qué es LangChain?", "expected": "general"}
+]

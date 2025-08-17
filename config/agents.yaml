@@ -1,0 +1,31 @@
+# config/agents.yaml
+llm_defaults:
+  provider: ollama
+  model: mistral:instruct
+  temperature: 0.1
+
+embeddings:
+  provider: ollama
+  model: mxbai-embed-large
+
+agents:
+  - name: rag_general
+    role: "RAG General"
+    domains: ["general", "career", "incident"]
+
+  - name: career_coach
+    role: "Coach de carrera"
+    domains: ["career", "general"]
+
+  - name: career_planner
+    role: "Plan 30/60/90 y crecimiento"
+    domains: ["career", "general"]
+
+  - name: incident_analyst
+    role: "Incident Analyst (SRE)"
+    # Si tenés docs en 'data/incidents', agrego ambos nombres:
+    domains: ["incident", "incidents", "general"]
+
+  - name: evaluador
+    role: "PM Evaluador de Proyectos"
+    domains: ["general", "career"]
