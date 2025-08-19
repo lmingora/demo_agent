@@ -1,29 +1,35 @@
+# src/agents/implementations/incident_analyst.py
 from __future__ import annotations
-from typing import Dict, Any
+from typing import Dict, Any, List
 from src.rag.toolbox import rag_search
-from src.agents.tools.structure_tools import five_whys, risk_matrix, summarize_evidence, kpi_suggestions
+from src.agents.tools.structure_tools import summarize_evidence
 
-PROMPT_EXTRA = (
-    "Estructura la salida con:\n"
-    "- **Cronología breve** (≤ 5 ítems)\n"
-    "- **5 Porqués** (usa `five_whys` si ayuda)\n"
-    "- **Causa raíz (hipótesis)**\n"
-    "- **3 acciones de mitigación** con responsable y ETA\n"
-    "Puedes incluir una **Matriz de Riesgos** (`risk_matrix`) si corresponde.\n"
-)
+def spec(agent_cfg: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Devuelve {prompt, tools} para create_react_agent.
+    Incluye rag_search y summarize_evidence.
+    """
+    # Dominios preferidos (quita 'general' si viene mezclado)
+    domains = [d for d in (agent_cfg.get("domains") or []) if d != "general"] or ["incident", "incidents"]
 
-def spec(agent_cfg: Dict[str, Any], cfg: Dict[str, Any]) -> dict:
-    domains = agent_cfg.get("domains") or ["incident","general"]
-    role = agent_cfg.get("role", "Incident Analyst (SRE)")
-    goal = agent_cfg.get("goal", "Analizar incidentes y mitigaciones.")
-    prompt = (
-        f"Eres **{agent_cfg['name']}**. Rol: {role}. Objetivo: {goal}\n"
-        f"Usa `rag_search` con domains={domains} para evidencia factual.\n"
-        "Puedes llamar `five_whys` y `risk_matrix` para estructurar.\n"
-        "Si la consulta pide métricas, `kpi_suggestions('incident', foco)`.\n"
-        "Usa `summarize_evidence` si el contexto es largo.\n"
-        + PROMPT_EXTRA +
-        "Responde en Markdown, claro y accionable."
-    )
-    tools = [rag_search, five_whys, risk_matrix, summarize_evidence, kpi_suggestions]
+    prompt = f"""Eres **Incident Analyst (SRE)**.
+Analizas incidentes, aplicas 5 Porqués para proponer causa raíz, mitigaciones y próximos pasos.
+
+Tienes acceso a herramientas:
+- rag_search: Recupera evidencia local por dominios. ÚSALA antes de afirmar hechos.
+- summarize_evidence: Comprime contexto en ≤ 8 bullets con fuentes.
+
+INSTRUCCIONES:
+- Si la consulta requiere hechos, primero busca evidencia con las herramientas.
+- No expliques ni muestres cómo usas las herramientas; simplemente úsalas.
+- No reveles pasos intermedios (Thought/Action/Observation). Devuelve solo el resultado final.
+- Si no hay evidencia suficiente, pide 1–2 datos clave (servicio, timeframe, métricas) y explica por qué.
+
+Formato de salida (ESPAÑOL):
+- **Cronología breve** (≤ 5 ítems)
+- **Causa raíz (hipótesis)**
+- **Mitigaciones y acciones** (3–5 bullets)
+- **Fuentes** (si hay pasajes)
+"""
+    tools: List = [rag_search, summarize_evidence]
     return {"prompt": prompt, "tools": tools}

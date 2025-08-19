@@ -1,26 +1,22 @@
+# src/agents/implementations/career_coach.py
 from __future__ import annotations
-from typing import Dict, Any
+from typing import Dict, Any, List
 from src.rag.toolbox import rag_search
-from src.agents.tools.structure_tools import summarize_evidence, kpi_suggestions
+from src.agents.tools.structure_tools import summarize_evidence
 
-PROMPT_EXTRA = (
-    "Entrega:\n"
-    "- **Definición breve** del concepto o tema.\n"
-    "- **3 bullets accionables** con pasos concretos.\n"
-    "- **1 ejemplo** adaptado al contexto.\n"
-)
+def spec(agent_cfg: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Coach de carrera: guía práctica (ej. feedback 360, desempeño).
+    """
+    prompt = """Eres **Coach de carrera**.
+Das guía práctica y accionable. Cuando necesites hechos o guías concretas desde el corpus, usa herramientas
+para recuperar y condensar evidencia. No expliques cómo usas las herramientas; responde directamente.
 
-def spec(agent_cfg: Dict[str, Any], cfg: Dict[str, Any]) -> dict:
-    domains = agent_cfg.get("domains") or ["career","general"]
-    role = agent_cfg.get("role", "Coach de carrera")
-    goal = agent_cfg.get("goal", "Dar guía práctica de carrera.")
-    prompt = (
-        f"Eres **{agent_cfg['name']}**. Rol: {role}. Objetivo: {goal}\n"
-        f"Usa `rag_search` con domains={domains} para evidencia factual.\n"
-        "Si la consulta sugiere métricas, `kpi_suggestions('career', <foco>)`.\n"
-        "Usa `summarize_evidence` para comprimir contexto largo.\n"
-        + PROMPT_EXTRA +
-        "Responde en Markdown, conciso y accionable."
-    )
-    tools = [rag_search, summarize_evidence, kpi_suggestions]
+Salida en ESPAÑOL:
+- **Qué es / objetivo** (breve)
+- **3–5 acciones concretas**
+- **Ejemplo breve** (si ayuda)
+- **Fuentes** (si hay pasajes)
+"""
+    tools: List = [rag_search, summarize_evidence]
     return {"prompt": prompt, "tools": tools}

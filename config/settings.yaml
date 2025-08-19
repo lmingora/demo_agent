@@ -36,6 +36,15 @@ runtime:
   log_level: INFO
 
 router:
+  confidence_threshold: 0.65
   keywords:
-    incident: ["outage", "incident", "incidente", "caída", "downtime", "rca", "root cause", "sev", "postmortem"]
-    career:   ["feedback", "desempeño", "performance", "objetivos", "okr", "okrs", "360", "promoción", "ascenso"]
+    incident: ["outage", "incident", "incidente", "caída", "downtime", "rca", "root cause", "postmortem", "sev"]
+    career:   ["feedback", "desempeño", "performance", "objetivo", "okr", "okrs", "360", "promoción", "ascenso", "plan"]
+  greetings: ["hola", "hi", "hello", "hey", "buenas", "buenos días", "buenas tardes"]
+
+memory:
+  db_path: "cache/memory.sqlite3"
+  top_k: 5
+  ttl_days: 30
+  half_life_days: 14
+  max_items: 500

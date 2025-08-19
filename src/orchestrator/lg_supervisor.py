@@ -1,6 +1,6 @@
 # src/orchestrator/lg_supervisor.py
 from __future__ import annotations
-from pathlib import Path
+from typing import Dict, Any, List, Optional
 
 from langgraph_supervisor import create_supervisor
 from langgraph.prebuilt import create_react_agent
@@ -8,7 +8,7 @@ from langchain_core.tools import BaseTool
 
 from src.llm.factory import make_chat
 from src.utils.logging import get_logger
-from src.rag.toolbox import rag_search  # para el agente genérico cuando no hay spec
+from src.rag.toolbox import rag_search  # fallback tool p/ agente genérico
 
 # Implementaciones (cada módulo expone spec(agent_cfg, cfg) -> {"prompt": str, "tools": List[Tool]})
 from src.agents.implementations import (
@@ -30,7 +30,7 @@ _SPEC_BY_NAME = {
     "evaluador": _evaluador.spec,
 }
 
-# Para fallback desde la CLI (p. ej., si el supervisor inventara un agente)
+# Para fallback desde la CLI
 _WORKERS_BY_NAME: Dict[str, Any] = {}
 
 
@@ -46,38 +46,54 @@ def get_agent_names() -> List[str]:
 
 def _build_worker(agent_cfg: Dict[str, Any], cfg: Dict[str, Any]) -> Any:
     """
-    Crea un agente ReAct preconstruido (LangGraph) con nombre estable.
-    - Si hay spec(): usa su prompt y tools.
-    - Si no hay: agente genérico con `rag_search` limitado a domains declarados.
+    Construye el grafo de un agente usando su spec (prompt + tools).
+
+    Nota:
+    - No pasamos extra_tools de handoff: el create_supervisor prebuilt ya genera
+      las transfer tools `transfer_to_<name>` y las gestiona él.
     """
-    name = agent_cfg["name"]
     try:
+        name = agent_cfg.get("name")
+        if not name:
+            raise ValueError(f"Spec de agente inválida (sin 'name'): {agent_cfg}")
+
         spec_fn = _SPEC_BY_NAME.get(name)
         if spec_fn is None:
+            # Agente genérico (fallback)
             domains = agent_cfg.get("domains") or ["general"]
             prompt = (
-                f"Eres **{name}** (rol: {agent_cfg.get('role','Agente')}).\n"
-                f"Para evidencia factual, usa la herramienta `rag_search` con domains={domains}.\n"
-                "Si falta información, pide 1–2 aclaraciones. Responde en Markdown claro."
+                f"Eres **{name}**. Rol: {agent_cfg.get('role','Agente')}.\n"
+                f"Usa `rag_search` con domains={domains} para evidencia factual.\n"
+                "No muestres código; usa herramientas si necesitás buscar.\n"
+                "Si falta info, pide 1–2 aclaraciones. Responde en Markdown."
             )
             tools: List[BaseTool] = [rag_search]
         else:
-            spec = spec_fn(agent_cfg, cfg)
-            prompt = spec["prompt"]
-            tools = list(spec["tools"])
+            spec = spec_fn(agent_cfg, cfg) or {}
+            prompt = spec.get("prompt") or (
+                f"Eres **{name}**. Responde en Markdown y usa herramientas cuando necesites evidencia."
+            )
+            tools = list(spec.get("tools") or [])
+            if not tools:
+                # Aseguramos al menos RAG básico
+                tools = [rag_search]
+                log.warning(f"Agente '{name}' sin tools en spec(); usando fallback [rag_search].")
 
-        # LLM del agente
-        llm = make_chat(cfg)  # NO bind_tools: create_react_agent gestiona tools internamente
-        # Agente ReAct preconstruido (name = identificador que usa el supervisor para handoffs)
-        worker = create_react_agent(
-            model=llm,
-            tools=tools,
-            prompt=prompt,
-            name=name,
-        )
-        return worker
+        # LLM + tools
+        llm = make_chat(cfg).bind_tools(tools)
+        graph = create_react_agent(llm, tools=tools, prompt=prompt, name=name)
+
+        # Logging defensivo para ver qué tools recibió el agente
+        try:
+            tool_names = [getattr(t, "name", getattr(t, "__name__", str(t))) for t in tools]
+            log.info(f"Agente '{name}' con tools: {tool_names}")
+        except Exception:
+            pass
+
+        return graph
+
     except Exception as e:
-        log.error(f"Error construyendo worker '{name}': {e}")
+        log.error(f"Error construyendo worker {agent_cfg.get('name')}: {e}")
         raise
 
 
@@ -94,33 +110,13 @@ def _make_supervisor_prompt(agent_names: List[str], cfg: Dict[str, Any]) -> str:
     inc_kw = ", ".join(rkw.get("incident", [])) or "(incidente, caída, outage, rca, ...)"
     car_kw = ", ".join(rkw.get("career", []))   or "(feedback, OKR, 360, desempeño, ...)"
 
-    # Few-shots canónicos (1 por agente clave)
+    # Few-shots canónicos
     shots = [
-        # general
-        (
-            "¿Qué es un pipeline en ingeniería de software y para qué sirve?",
-            "rag_general"
-        ),
-        # career_coach
-        (
-            "¿Qué es el feedback 360 y cómo pedirlo? Quiero 3 acciones concretas.",
-            "career_coach"
-        ),
-        # career_planner
-        (
-            "Quiero un plan 30/60/90 para pasar a SRE II enfocado en fiabilidad.",
-            "career_planner"
-        ),
-        # incident_analyst
-        (
-            "Tuvimos una caída hoy 14:05 (12 min). Aplicá 5 Porqués y mitigaciones.",
-            "incident_analyst"
-        ),
-        # evaluador
-        (
-            "Evaluá este plan y devolvé fortalezas, áreas de mejora, 30/60/90 y riesgos.",
-            "evaluador"
-        ),
+        ("¿Qué es un pipeline en ingeniería de software y para qué sirve?", "rag_general"),
+        ("¿Qué es el feedback 360 y cómo pedirlo? Quiero 3 acciones concretas.", "career_coach"),
+        ("Quiero un plan 30/60/90 para pasar a SRE II enfocado en fiabilidad.", "career_planner"),
+        ("Tuvimos una caída hoy 14:05 (12 min). Aplicá 5 Porqués y mitigaciones.", "incident_analyst"),
+        ("Evaluá este plan y devolvé fortalezas, áreas de mejora, 30/60/90 y riesgos.", "evaluador"),
     ]
     examples = "\n\n".join(
         (
@@ -151,15 +147,38 @@ def _make_supervisor_prompt(agent_names: List[str], cfg: Dict[str, Any]) -> str:
         "Responde SIEMPRE con ese bloque Action/Action Input y nada más."
     )
 
+
+def _ensure_unique_names(agents_cfg: List[Dict[str, Any]]) -> None:
+    names: List[str] = []
+    dups: List[str] = []
+    for a in agents_cfg:
+        n = a.get("name")
+        if not n:
+            continue
+        if n in names:
+            dups.append(n)
+        names.append(n)
+    if dups:
+        raise ValueError(f"Nombres de agentes duplicados: {sorted(set(dups))}. Deben ser únicos.")
+
+
 def build_app(cfg: Dict[str, Any]) -> Any:
     """
     Construye y compila el grafo del supervisor (API oficial):
       - workers: LISTA de agentes (cada uno con name único)
-      - supervisor: create_supervisor(agents=workers, model=..., prompt=...)  -> .compile()
+      - supervisor: create_supervisor(agents=workers, model=..., prompt=...) -> .compile()
     """
+    if not isinstance(cfg, dict):
+        raise TypeError(
+            f"build_supervisor_app esperaba cfg (dict), recibió {type(cfg).__name__}. "
+            "Pasá el dict que retorna load_cfg()."
+        )
+
     agents_cfg = cfg.get("agents", []) or []
     if not agents_cfg:
         raise ValueError("No hay agentes definidos en config/agents.yaml")
+
+    _ensure_unique_names(agents_cfg)
 
     # 1) Construir workers como LISTA (canónico para create_supervisor)
     workers: List[Any] = []
@@ -182,20 +201,29 @@ def build_app(cfg: Dict[str, Any]) -> Any:
     # 3) Prompt del supervisor
     sup_prompt = _make_supervisor_prompt(names, cfg)
 
-
-    # 4) Crear supervisor (firma oficial: agents=list, model=..., prompt=...)
-    #    handoff_tool_prefix=None -> usa 'transfer_to_<name>' por defecto
-    #    include_agent_name="inline" ayuda con providers que no propagan name
+    # 4) Crear supervisor (firma oficial: lista de workers)
     supervisor = create_supervisor(
         agents=workers,
         model=sup_llm,
         prompt=sup_prompt,
-        handoff_tool_prefix=None,
-        include_agent_name="inline",
+        handoff_tool_prefix=None,     # 'transfer_to_<name>' por defecto
+        include_agent_name="inline",  # ayuda a preservar el name
     )
 
-    # 5) Compilar SIEMPRE (para disponer de .invoke / .stream)
-    compiled = supervisor.compile()
+    # 5) Compilar (con o sin checkpointer SQLite)
+    compiled = None
+    if (cfg.get("features", {}) or {}).get("use_checkpointer_sqlite", False):
+        try:
+            from langgraph.checkpoint.sqlite import SqliteSaver
+            cp_path = (cfg.get("features", {}) or {}).get("sqlite_checkpoint_path", "cache/checkpoints.sqlite3")
+            cp = SqliteSaver(cp_path)
+            compiled = supervisor.compile(checkpointer=cp)
+            log.info(f"Supervisor compilado con SqliteSaver (checkpoint={cp_path}).")
+        except Exception as e:
+            log.warning(f"No se pudo activar checkpointer SQLite: {e}. Compilo sin checkpoint.")
+            compiled = supervisor.compile()
+    else:
+        compiled = supervisor.compile()
+        log.info("Supervisor compilado sin checkpointer.")
 
-    log.info("Supervisor compilado (prebuilt, lista de workers, handoffs internos).")
     return compiled

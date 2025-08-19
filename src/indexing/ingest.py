@@ -1,15 +1,20 @@
+# src/indexing/ingest.py
 from __future__ import annotations
 from typing import Dict, Any, List
 from pathlib import Path
 import shutil, json, os
 from tempfile import NamedTemporaryFile
+
 from langchain_core.documents import Document
+
 from src.rag.splitters import make_splitter_for
 from src.rag.vectorstores import make_vectorstore, add_documents, delete_by_path_and_domain
-from src.rag.retrievers import _bm25_store_path
+from src.rag.toolbox import get_vectorstore  # reusar si ya está inicializado
+from src.rag.retrievers import bm25_store_path  # ← devuelve directorio, no archivo
 from src.utils.logging import get_logger
 
 log = get_logger("indexing.ingest")
+
 
 def _read_text(path: Path) -> str:
     try:
@@ -18,12 +23,28 @@ def _read_text(path: Path) -> str:
         log.error(f"Error leyendo {path}: {e}")
         raise
 
+
 def _split_text(path: Path, text: str, chunk_size: int = 1200, overlap: int = 200) -> List[str]:
+    """
+    Devuelve lista de strings con los chunks. Soporta splitters que devuelven strings
+    o Document objects.
+    """
     splitter = make_splitter_for(path, chunk_size=chunk_size, overlap=overlap)
-    if hasattr(splitter, "split_text"):
-        return splitter.split_text(text)
-    docs = splitter.split_text(text)
-    return [d.page_content for d in docs]
+    try:
+        out = splitter.split_text(text)
+    except TypeError:
+        # Algunos splitters exponen firma distinta (poco común), intentamos fallback
+        out = splitter.split_text(text=text)
+
+    if not out:
+        return []
+
+    # Normalizar a lista de strings
+    if isinstance(out, list) and out and hasattr(out[0], "page_content"):
+        # p.ej., cuando el splitter devuelve Documents
+        return [d.page_content for d in out]  # type: ignore[attr-defined]
+    return list(out)
+
 
 def _atomic_write_jsonl(target: Path, records: List[dict]):
     try:
@@ -32,16 +53,22 @@ def _atomic_write_jsonl(target: Path, records: List[dict]):
             for rec in records:
                 tmp.write(json.dumps(rec, ensure_ascii=False) + "\n")
             tmp_path = Path(tmp.name)
-        os.replace(tmp_path, target)  # atomic on POSIX
+        os.replace(tmp_path, target)  # atomic en POSIX
     except Exception as e:
-        log.error(f"Error escritura atomica JSONL {target}: {e}")
+        log.error(f"Error escritura atómica JSONL {target}: {e}")
         raise
 
+
 def index_path(cfg: Dict[str, Any], src_path: str, domain: str = "general") -> str:
-    """Upsertea un archivo en data/<domain>/ y actualiza vectorstore + BM25 JSONL.
-    - Si el archivo YA está en data/<domain>/, indexa in-place.
-    - Lee chunk_size/overlap desde settings.yaml > retrieval si están.
-    - Si el archivo rinde 0 chunks, elimina entradas previas y retorna sin error.
+    """
+    Upsertea un archivo en data/<domain>/ y actualiza:
+      1) VectorStore (borrando lo previo por (path, domain) y reinsertando).
+      2) Cache BM25 en JSONL: cache/bm25/<domain>.jsonl
+
+    Reglas:
+      - Si el archivo YA está en data/<domain>/, indexa in-place (no copia).
+      - chunk_size/overlap se leen de settings.yaml > retrieval.
+      - Si el archivo rinde 0 chunks, borra entradas previas y retorna sin error.
     """
     data_dir = Path(cfg["paths"]["data_dir"]).resolve()
     dst_dir = (data_dir / domain).resolve()
@@ -63,7 +90,7 @@ def index_path(cfg: Dict[str, Any], src_path: str, domain: str = "general") -> s
         dst = (dst_dir / src.name).resolve()
         try:
             if src.exists() and dst.exists() and src.samefile(dst):
-                pass  # mismo archivo
+                pass  # mismo archivo físico
             else:
                 shutil.copy2(src, dst)
         except FileNotFoundError:
@@ -89,42 +116,50 @@ def index_path(cfg: Dict[str, Any], src_path: str, domain: str = "general") -> s
         else:
             path_key = str(dst)
 
-        # Vectorstore: eliminar versiones previas de este archivo
-        vs = make_vectorstore(cfg)
+        # 1) Vectorstore: eliminar versiones previas de este archivo
+        vs = get_vectorstore() or make_vectorstore(cfg)
         delete_by_path_and_domain(vs, path_key, domain)
 
-        # BM25 JSONL actual: cargar y filtrar lo previo por path
-        p = _bm25_store_path(cfg, domain)
-        old = []
-        if p.exists():
-            for line in p.read_text(encoding="utf-8").splitlines():
+        # 2) BM25 JSONL por dominio
+        bm25_dir = bm25_store_path(cfg)                 # ← directorio
+        jsonl    = bm25_dir / f"{domain}.jsonl"         # ← archivo por dominio
+
+        old: List[dict] = []
+        if jsonl.exists():
+            for line in jsonl.read_text(encoding="utf-8").splitlines():
                 try:
                     rec = json.loads(line)
-                    if rec["metadata"].get("path") != path_key:
+                    if rec.get("metadata", {}).get("path") != path_key:
                         old.append(rec)
                 except Exception:
                     continue
 
         # Si no hay chunks, persistimos la limpieza y salimos
         if not chunks:
-            _atomic_write_jsonl(p, old)
+            _atomic_write_jsonl(jsonl, old)
             msg = f"Indexado: dom={domain}, archivo={Path(path_key).name}, chunks=0 (sin contenido indexable)"
             log.info(msg)
             return msg
 
         # Construir documentos y upsert
-        docs = []
+        docs: List[Document] = []
         for i, ch in enumerate(chunks):
-            md = {"path": path_key, "domain": domain, "chunk_id": f"{path_key}#{i}", "mtime": mtime}
+            md = {
+                "path": path_key,
+                "domain": domain,
+                "chunk_id": f"{path_key}#{i}",
+                "mtime": mtime,
+            }
             docs.append(Document(page_content=ch, metadata=md))
             old.append({"text": ch, "metadata": md})
 
         add_documents(vs, docs)
-        _atomic_write_jsonl(p, old)
+        _atomic_write_jsonl(jsonl, old)
 
         msg = f"Indexado: dom={domain}, archivo={Path(path_key).name}, chunks={len(chunks)}"
         log.info(msg)
         return msg
+
     except Exception as e:
         log.exception(f"Fallo indexando {dst}: {e}")
         return f"Error indexando: {e}"

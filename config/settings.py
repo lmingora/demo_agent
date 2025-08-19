@@ -2,10 +2,10 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List
-import os
 import yaml
 import logging
 
+# ───────────────────────── Logger ─────────────────────────
 _LOGGER_NAME = "app.config"
 log = logging.getLogger(_LOGGER_NAME)
 if not log.handlers:
@@ -15,7 +15,16 @@ if not log.handlers:
     log.addHandler(h)
     log.setLevel(logging.INFO)
 
+# ───────────────────── Helpers de paths ───────────────────
+def _repo_root() -> Path:
+    # Raíz del repo: .../demo_agent/
+    return Path(__file__).resolve().parents[1]
 
+def _cfg_path(name: str) -> Path:
+    # Archivo dentro de /config
+    return _repo_root() / "config" / name
+
+# ────────────────────── Helpers YAML ──────────────────────
 def _load_yaml(path: Path) -> Dict[str, Any]:
     if not path.exists():
         log.warning(f"YAML no encontrado: {path}")
@@ -30,28 +39,25 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
         log.error(f"Error leyendo YAML {path}: {e}")
         return {}
 
-
 def _normalize_agents(raw: Any) -> List[Dict[str, Any]]:
     """
     Acepta lista de agentes o variantes y devuelve lista normalizada.
     Reglas:
-    - Debe quedar una lista de dicts con 'name' obligatorio.
+    - Devuelve lista de dicts con 'name' obligatorio.
     - Si falta 'domains', setea ['general'].
-    - Filtra entradas vacías.
+    - Filtra entradas vacías o inválidas.
     """
     agents: List[Dict[str, Any]] = []
-
     if not raw:
         return agents
 
     if isinstance(raw, list):
         items = raw
     elif isinstance(raw, dict):
-        # Soportar un formato viejo: {"agents": [...]} o {"agente1": {...}, ...}
+        # Soportar formato viejo: {"agents": [...]} o {"agente1": {...}, ...}
         if "agents" in raw and isinstance(raw["agents"], list):
             items = raw["agents"]
         else:
-            # mapa nombre->spec → convertir a lista
             items = []
             for k, v in raw.items():
                 if isinstance(v, dict):
@@ -74,24 +80,20 @@ def _normalize_agents(raw: Any) -> List[Dict[str, Any]]:
 
     return agents
 
-
+# ─────────────────────── Cargas main ──────────────────────
 def load_cfg() -> Dict[str, Any]:
     """
     Carga y fusiona:
       - config/settings.yaml (base)
       - config/agents.yaml   (agents, llm_defaults, embeddings, router opcional)
-      - config/docs.yaml     (opcional, no se fusiona en cfg; lo dejamos a la CLI)
+      - config/docs.yaml     (no se fusiona en cfg; se consulta aparte si hace falta)
     Prioridad:
       - settings.yaml domina en llm_defaults/embeddings si hay duplicado.
-      - agents.yaml provee 'agents' (lista final).
+      - agents.yaml provee 'agents' (lista final normalizada).
     """
-    # Este archivo vive en .../config/settings.py
-    config_dir = Path(__file__).resolve().parent
-    repo_root = config_dir.parent
-
-    settings_path = config_dir / "settings.yaml"
-    agents_path   = config_dir / "agents.yaml"
-    docs_path     = config_dir / "docs.yaml"  # opcional
+    settings_path = _cfg_path("settings.yaml")
+    agents_path   = _cfg_path("agents.yaml")
+    docs_path     = _cfg_path("docs.yaml")
 
     log.info(f"settings.yaml: {settings_path}")
     log.info(f"agents.yaml  : {agents_path}")
@@ -104,8 +106,7 @@ def load_cfg() -> Dict[str, Any]:
     # base: settings.yaml
     cfg: Dict[str, Any] = dict(settings or {})
 
-    # merge suaves desde agents.yaml
-    # (si en el futuro querés que agents.yaml overridee llm_defaults/embeddings, invertí la prioridad)
+    # merge suave desde agents.yaml (solo si faltan en settings)
     if "llm_defaults" not in cfg and "llm_defaults" in agents_y:
         cfg["llm_defaults"] = agents_y["llm_defaults"]
     if "embeddings" not in cfg and "embeddings" in agents_y:
@@ -145,7 +146,7 @@ def load_cfg() -> Dict[str, Any]:
     cfg.setdefault("runtime", {})
     cfg["runtime"].setdefault("log_level", "INFO")
 
-    # Validación dura de agentes
+    # Validación de agentes
     if not cfg["agents"]:
         raise ValueError(
             "No hay agentes definidos en config/agents.yaml -> clave 'agents'.\n"
@@ -157,5 +158,29 @@ def load_cfg() -> Dict[str, Any]:
 
     names = [a["name"] for a in cfg["agents"]]
     log.info(f"Agentes cargados: {', '.join(names)}")
-
     return cfg
+
+# ────────────── Helpers adicionales (para imports) ─────────
+def load_agents_cfg() -> List[Dict[str, Any]]:
+    """
+    Devuelve la lista de agentes leyendo directamente config/agents.yaml,
+    normalizada con _normalize_agents. Útil para componentes que sólo
+    necesitan los agentes (p. ej., el pre-router).
+    """
+    agents_path = _cfg_path("agents.yaml")
+    agents_y = _load_yaml(agents_path)
+    agents = _normalize_agents(agents_y.get("agents"))
+    names = [a.get("name") for a in agents if a.get("name")]
+    if names:
+        log.info(f"Agentes cargados: {', '.join(names)}")
+    else:
+        log.warning("No se encontraron agentes en config/agents.yaml (clave 'agents' vacía)")
+    return agents
+
+def load_docs_cfg() -> Dict[str, Any]:
+    """
+    Devuelve el mapeo de dominios → rutas desde config/docs.yaml.
+    Si no existe, devuelve {}.
+    """
+    docs_path = _cfg_path("docs.yaml")
+    return _load_yaml(docs_path)
