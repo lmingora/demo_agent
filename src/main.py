@@ -211,14 +211,16 @@ def _maybe_force_tool_execution(answer_text: str, user_text: str, cfg: dict) -> 
         k = cfg.get("retrieval", {}).get("k", 8)
 
     # 1) Ejecutar RAG
+    # dentro de _maybe_force_tool_execution(...)
     obs = rag_search.invoke({"query": q, "domains": domains, "k": k}) or {}
-    results = obs.get("results") or []
-    if not results:
-        return ("No encontré evidencia local para esa consulta. "
-                "Decime servicio/fecha y vuelvo a intentar con más contexto.")
+    context_md = obs.get("context_md")  # <= usar el que viene de la tool
+    if not context_md:
+        results = obs.get("results") or []
+        if not results:
+            return ("No encontré evidencia local para esa consulta. "
+                    "Decime servicio/fecha y vuelvo a intentar con más contexto.")
+        context_md = _results_to_context_md(results)
 
-    # 2) Construir context_md y resumir evidencia
-    context_md = _results_to_context_md(results)
     summ = summarize_evidence.invoke({"context_md": context_md}) or ""
 
     # 3) Cierre con LLM (formato tipo incidente)

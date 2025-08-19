@@ -99,36 +99,77 @@ def _build_worker(agent_cfg: Dict[str, Any], cfg: Dict[str, Any]) -> Any:
 
 def _make_supervisor_prompt(agent_names: List[str], cfg: Dict[str, Any]) -> str:
     """
-    Prompt ESTRICTO para el supervisor con reglas de ruteo (keywords) y few-shots.
-    - Usa sólo tools `transfer_to_<agente>`.
-    - Formato ReAct: Action ... / Action Input: {}
+    Prompt del supervisor SIN reglas duras.
+    - Whitelist derivada de agents.yaml
+    - Tabla dinámica con (Agente / Rol / Dominios)
+    - Few-shots canónicos (1 por agente) auto-derivados
     """
-    agents_str = ", ".join(agent_names)
+    # --- 1) Whitelist/tabla (derivada de cfg["agents"]) ---
+    agents_cfg = cfg.get("agents", []) or []
+    # Mapear name -> (role, domains)
+    rows = []
+    for a in agents_cfg:
+        name = a.get("name", "").strip()
+        if not name:
+            continue
+        role = a.get("role", "").strip() or "Agente"
+        domains = a.get("domains") or ["general"]
+        rows.append((name, role, ", ".join(domains)))
 
-    # Hints desde settings.yaml -> router.keywords
-    rkw = (cfg.get("router", {}) or {}).get("keywords", {}) or {}
-    inc_kw = ", ".join(rkw.get("incident", [])) or "(incidente, caída, outage, rca, ...)"
-    car_kw = ", ".join(rkw.get("career", []))   or "(feedback, OKR, 360, desempeño, ...)"
+    whitelist_str = ", ".join([r[0] for r in rows]) if rows else ", ".join(agent_names)
 
-    # Few-shots canónicos
-    shots = [
-        ("¿Qué es un pipeline en ingeniería de software y para qué sirve?", "rag_general"),
-        ("¿Qué es el feedback 360 y cómo pedirlo? Quiero 3 acciones concretas.", "career_coach"),
-        ("Quiero un plan 30/60/90 para pasar a SRE II enfocado en fiabilidad.", "career_planner"),
-        ("Tuvimos una caída hoy 14:05 (12 min). Aplicá 5 Porqués y mitigaciones.", "incident_analyst"),
-        ("Evaluá este plan y devolvé fortalezas, áreas de mejora, 30/60/90 y riesgos.", "evaluador"),
-    ]
-    examples = "\n\n".join(
-        (
-            f"Thought: El mensaje corresponde a {agente}.\n"
-            f"Action: transfer_to_{agente}\n"
-            "Action Input: {}"
-        ) for (_q, agente) in shots
-    )
+    # tabla markdown
+    table_lines = ["| Agente | Rol | Dominios |", "|---|---|---|"]
+    for name, role, doms in rows:
+        table_lines.append(f"| {name} | {role} | {doms} |")
+    table_md = "\n".join(table_lines)
 
+    # --- 2) Few-shots canónicos (derivados por nombre; fallback genérico) ---
+    #   Nota: no incrustamos “reglas”; sólo ejemplos de entrada → handoff correcto.
+    CANON_Q = {
+        "rag_general":       "¿Qué es un pipeline en ingeniería de software y para qué sirve?",
+        "career_coach":      "Necesito feedback 360 para mi evaluación. Dame 3 pasos prácticos para pedirlo.",
+        "career_planner":    "Armá un plan 30/60/90 para mi onboarding como backend en microservicios.",
+        "incident_analyst":  "Tuvimos un incidente sev2 con 12 minutos de downtime hoy. Aplicá 5 porqués y da mitigaciones.",
+        "evaluador":         "Evaluá este plan: mejorar release cycle en 6 semanas. Dame fortalezas, áreas de mejora, 30/60/90 y riesgos.",
+    }
+
+    def _fallback_q(a: Dict[str, Any]) -> str:
+        doms = a.get("domains") or ["general"]
+        dom = doms[0]
+        if dom in ("incident", "incidents"):
+            return "Hay una caída reciente. Necesito análisis, causa raíz y mitigaciones."
+        if dom == "career":
+            return "Quiero mejorar mi desempeño. Sugiéreme 3 acciones prácticas."
+        return "Necesito una explicación breve y un ejemplo concreto."
+
+    # Formato ReAct estricto esperado para el supervisor
+    def _supervisor_action(agent: str) -> str:
+        return (
+            f"Thought: El mensaje corresponde a {agent}.\n"
+            f"Action: transfer_to_{agent}\n"
+            f"Action Input: {{}}"
+        )
+
+    fewshots_blocks: List[str] = []
+    # seguimos el orden del grafo (agent_names)
+    by_name = {a.get("name"): a for a in agents_cfg}
+    for name in agent_names:
+        a = by_name.get(name, {"name": name})
+        q = CANON_Q.get(name) or _fallback_q(a)
+        fewshots_blocks.append(
+            f"Usuario: {q}\n{_supervisor_action(name)}"
+        )
+
+    fewshots_md = "\n\n".join(fewshots_blocks)
+
+    # --- 3) Prompt final del supervisor (sin reglas heurísticas) ---
     return (
-        "Eres el SUPERVISOR del orquestador. Tu tarea es ELEGIR el agente adecuado y delegar con una sola tool.\n"
-        f"Agentes disponibles (whitelist): {agents_str}\n\n"
+        "Eres el **SUPERVISOR** del orquestador. Tu tarea es elegir el agente adecuado "
+        "y delegar con una sola herramienta de handoff.\n\n"
+        f"Agentes disponibles (whitelist): {whitelist_str}\n\n"
+        "Descripción de agentes:\n"
+        f"{table_md}\n\n"
         "REGLAS ESTRICTAS:\n"
         "1) NO hables con el usuario ni generes prosa.\n"
         "2) Usa EXCLUSIVAMENTE el formato ReAct de tools:\n"
@@ -136,16 +177,12 @@ def _make_supervisor_prompt(agent_names: List[str], cfg: Dict[str, Any]) -> str:
         "   Action: transfer_to_<agente>\n"
         "   Action Input: {}\n"
         "3) NO agregues argumentos (Action Input DEBE ser {}).\n"
-        "4) Si dudas, usa 'rag_general'. PROHIBIDO inventar nombres (assistant, chatbot, etc.).\n\n"
-        "GUÍAS DE RUTEO (heurísticas):\n"
-        f"- Si el mensaje contiene términos de INCIDENTES ({inc_kw}) → 'incident_analyst'.\n"
-        f"- Si el mensaje es de carrera (p. ej., {car_kw}) → 'career_coach' o 'career_planner' si pide 30/60/90.\n"
-        "- Si pide evaluar un plan con fortalezas/áreas/30-60-90/risgos → 'evaluador'.\n"
-        "- Si es una definición o consulta general de tecnología → 'rag_general'.\n\n"
-        "EJEMPLOS VÁLIDOS:\n"
-        f"{examples}\n\n"
+        "4) Si dudas, usa 'rag_general'. PROHIBIDO inventar nombres.\n\n"
+        "EJEMPLOS (uno por agente):\n"
+        f"{fewshots_md}\n\n"
         "Responde SIEMPRE con ese bloque Action/Action Input y nada más."
     )
+
 
 
 def _ensure_unique_names(agents_cfg: List[Dict[str, Any]]) -> None:
