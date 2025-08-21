@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import math
+import json
 import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,9 +16,7 @@ from src.utils.logging import get_logger
 log = get_logger("rag.retrievers")
 
 # ---------------------- Estado de módulo ----------------------
-_VS: Any = None            # VectorStore (LangChain), seteado vía set_vectorstore()
-_CFG: Dict[str, Any] = {}  # settings completos, seteados en init_bm25()
-
+_VS = None  # VectorStore (LangChain) seteado vía set_vectorstore
 _BM25_READY = False
 
 # Índice BM25 en memoria
@@ -29,46 +28,36 @@ _BM25_AVGDL: float = 0.0
 _BM25_K1 = 1.5
 _BM25_B = 0.75
 
-# Dominios detectados (basado en metadata domain o path)
+# Dominios detectados
 _DOMAINS: List[str] = []
 
-# --- BM25 store path (compat con código viejo) ---
+# --- BM25 store base dir ---
 _BM25_STORE_DIR = "cache/bm25"
 
-def bm25_store_path(cfg: Optional[Dict[str, Any]] = None) -> Path:
+
+def bm25_store_path(cfg: Optional[Dict[str, Any]] = None, domain: Optional[str] = None) -> Path:
     """
-    Devuelve el directorio donde se podría persistir/cachar BM25 (si aplica).
-    Lee cfg['bm25']['store_dir'] si está disponible; si no, usa _BM25_STORE_DIR.
+    Devuelve:
+      - si domain=None: carpeta base para JSONL
+      - si domain=str : archivo JSONL de ese dominio
+    Crea la carpeta si no existe.
     """
     global _BM25_STORE_DIR
     if cfg:
-        try:
-            _BM25_STORE_DIR = cfg.get("bm25", {}).get("store_dir", _BM25_STORE_DIR)
-        except Exception:
-            pass
-    p = Path(_BM25_STORE_DIR)
-    try:
-        p.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-    return p
+        _BM25_STORE_DIR = cfg.get("bm25", {}).get("store_dir", _BM25_STORE_DIR)
+    base = Path(_BM25_STORE_DIR)
+    base.mkdir(parents=True, exist_ok=True)
+    return base if domain is None else (base / f"{domain}.jsonl")
 
-# Alias compat para imports antiguos
+# Alias compat
 _bm25_store_path = bm25_store_path
+
 
 # ---------------------- Utilidades ----------------------
 def _tokenize(text: str) -> List[str]:
-    """Tokenización unicode simple (lower y \w+)."""
-    return [t for t in re.findall(r"\w+", (text or "").lower(), flags=re.UNICODE) if t]
+    toks = re.findall(r"\w+", text.lower(), flags=re.UNICODE)
+    return [t for t in toks if t]
 
-def _chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
-    """Chunking por caracteres con solapamiento (robusto y determinista)."""
-    if not text:
-        return []
-    if chunk_size <= 0:
-        return [text]
-    step = max(1, chunk_size - max(0, overlap))
-    return [text[i : i + chunk_size] for i in range(0, len(text), step)]
 
 def _hash_key(source: str, text: str) -> str:
     h = hashlib.sha256()
@@ -77,44 +66,61 @@ def _hash_key(source: str, text: str) -> str:
     h.update((text or "").encode("utf-8"))
     return h.hexdigest()[:16]
 
-def _detect_domains_from_docs(docs: List[Document]) -> List[str]:
-    vals = set()
-    for d in docs:
-        md = d.metadata or {}
-        dom = md.get("domain")
-        if not dom:
-            # inferir de ruta: data/<domain>/...
-            src = (md.get("source") or md.get("path") or "")
-            parts = Path(src).parts
-            for p in parts:
-                if p in {"career", "general", "incident", "incidents", "training"}:
-                    dom = p
-                    break
-        if dom:
-            vals.add(dom)
-    return sorted(vals) if vals else []
 
 # ---------------------- API pública requerida ----------------------
 def set_vectorstore(vs: Any) -> None:
-    """Recibe el VectorStore (Chroma u otro) para búsquedas densas."""
     global _VS
     _VS = vs
     log.info("Vectorstore recibido en retrievers.")
 
+
 def list_domains() -> List[str]:
-    """Dominios conocidos por el índice BM25 o detectados en los docs."""
     return list(_DOMAINS)
+
+
+def _load_bm25_from_jsonl(cfg: Dict[str, Any]) -> bool:
+    """Intenta cargar BM25 desde JSONL en cache/bm25/*.jsonl (si existen)."""
+    global _BM25_DOCS, _BM25_TOKS, _DOMAINS
+
+    base = bm25_store_path(cfg, None)
+    files = sorted([p for p in base.glob("*.jsonl") if p.is_file()])
+    if not files:
+        return False
+
+    _BM25_DOCS.clear()
+    _BM25_TOKS.clear()
+    doms = set()
+
+    for fp in files:
+        domain = fp.stem
+        try:
+            for line in fp.read_text(encoding="utf-8").splitlines():
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                text = rec.get("text") or ""
+                md = rec.get("metadata") or {}
+                # aseguramos metadata coherente
+                md.setdefault("domain", domain)
+                doc = Document(page_content=text, metadata=md)
+                _BM25_DOCS.append(doc)
+                _BM25_TOKS.append(_tokenize(text))
+                doms.add(domain)
+        except Exception as e:
+            log.warning(f"No se pudo leer BM25 JSONL {fp}: {e}")
+
+    _DOMAINS[:] = sorted(doms)
+    return len(_BM25_DOCS) > 0
+
 
 def init_bm25(cfg: Dict[str, Any]) -> None:
     """
-    Construye un BM25 en memoria leyendo archivos de `paths.data_dir`.
-    Chunking según retrieval.chunk_size/overlap y metadata:
-      - source (ruta)
-      - domain (carpeta de primer nivel bajo data_dir)
-    Guarda cfg global para poder leer k y ensemble_weights luego.
+    Construye un BM25 en memoria. Preferencia:
+      1) Si hay JSONL en cache/bm25/*.jsonl (producido por indexing.ingest) → usar eso (contiene owner).
+      2) Si no hay JSONL → fallback a recorrer data_dir y chunkear (sin owner).
     """
-    global _BM25_DOCS, _BM25_TOKS, _BM25_IDF, _BM25_DF, _BM25_AVGDL, _BM25_READY, _DOMAINS, _CFG
-    _CFG = cfg or {}
+    global _BM25_DOCS, _BM25_TOKS, _BM25_IDF, _BM25_DF, _BM25_AVGDL, _BM25_READY, _DOMAINS
 
     _BM25_DOCS = []
     _BM25_TOKS = []
@@ -124,55 +130,70 @@ def init_bm25(cfg: Dict[str, Any]) -> None:
     _BM25_READY = False
     _DOMAINS = []
 
-    data_dir = Path(_CFG.get("paths", {}).get("data_dir", "data")).resolve()
-    if not data_dir.exists():
-        log.warning(f"BM25: data_dir no existe: {data_dir}")
-        return
+    # 1) Intentar JSONL (incluye owner)
+    if _load_bm25_from_jsonl(cfg):
+        log.info(f"BM25: cargado desde JSONL ({len(_BM25_TOKS)} chunks, doms={_DOMAINS})")
+    else:
+        # 2) Fallback a filesystem
+        data_dir = Path(cfg.get("paths", {}).get("data_dir", "data")).resolve()
+        if not data_dir.exists():
+            log.warning(f"BM25: data_dir no existe: {data_dir}")
+            return
 
-    chunk_size = int(_CFG.get("retrieval", {}).get("chunk_size", 1200))
-    overlap = int(_CFG.get("retrieval", {}).get("overlap", 200))
+        rcfg = (cfg.get("retrieval", {}) or {})
+        chunk_size = int(rcfg.get("chunk_size", 1200))
+        overlap = int(rcfg.get("overlap", 200))
 
-    total_chunks = 0
-    domain_counts: Dict[str, int] = {}
-    for root, _, files in os.walk(data_dir):
-        root_path = Path(root)
-        try:
-            rel = root_path.relative_to(data_dir)
-            parts = rel.parts
-            domain = parts[0] if parts else "general"
-        except Exception:
-            domain = "general"
+        def _chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
+            if not text:
+                return []
+            if chunk_size <= 0:
+                return [text]
+            step = max(1, chunk_size - max(0, overlap))
+            return [text[i : i + chunk_size] for i in range(0, len(text), step)]
 
-        for fname in files:
-            if not fname.lower().endswith((".txt", ".md", ".markdown")):
-                continue
-            path = root_path / fname
+        domain_counts: Dict[str, int] = {}
+        for root, _, files in os.walk(data_dir):
+            root_path = Path(root)
             try:
-                text = path.read_text(encoding="utf-8", errors="ignore")
-            except Exception as e:
-                log.warning(f"No se pudo leer {path}: {e}")
-                continue
+                rel = root_path.relative_to(data_dir)
+                parts = rel.parts
+                domain = parts[0] if parts else "general"
+            except Exception:
+                domain = "general"
 
-            chunks = _chunk_text(text, chunk_size, overlap)
-            for ch in chunks:
-                if not ch.strip():
+            for fname in files:
+                if not fname.lower().endswith((".txt", ".md", ".markdown")):
                     continue
-                doc = Document(
-                    page_content=ch,
-                    metadata={"source": str(path), "domain": domain},
-                )
-                _BM25_DOCS.append(doc)
-                _BM25_TOKS.append(_tokenize(ch))
-                total_chunks += 1
-                domain_counts[domain] = domain_counts.get(domain, 0) + 1
+                path = root_path / fname
+                try:
+                    text = path.read_text(encoding="utf-8", errors="ignore")
+                except Exception as e:
+                    log.warning(f"No se pudo leer {path}: {e}")
+                    continue
 
-    if total_chunks == 0:
-        log.info("BM25 vacío (no se encontraron chunks).")
+                chunks = _chunk_text(text, chunk_size, overlap)
+                for ch in chunks:
+                    if not ch.strip():
+                        continue
+                    md = {"source": str(path), "domain": domain}
+                    _BM25_DOCS.append(Document(page_content=ch, metadata=md))
+                    _BM25_TOKS.append(_tokenize(ch))
+                    domain_counts[domain] = domain_counts.get(domain, 0) + 1
+
+        _DOMAINS[:] = sorted(domain_counts.keys())
+        for d, n in domain_counts.items():
+            log.info(f"BM25[{d}] cargado con {n} chunks (filesystem)")
+
+    # Estadísticas BM25
+    if not _BM25_TOKS:
+        log.info("BM25 vacío")
         return
 
-    # DF / IDF
+    # DF por término
     for toks in _BM25_TOKS:
-        for t in set(toks):
+        seen = set(toks)
+        for t in seen:
             _BM25_DF[t] = _BM25_DF.get(t, 0) + 1
 
     N = len(_BM25_TOKS)
@@ -180,105 +201,74 @@ def init_bm25(cfg: Dict[str, Any]) -> None:
     for t, df in _BM25_DF.items():
         _BM25_IDF[t] = math.log(1 + (N - df + 0.5) / (df + 0.5))
 
-    _DOMAINS = sorted(domain_counts.keys())
     _BM25_READY = True
-    for d, n in domain_counts.items():
-        log.info(f"BM25[{d}] cargado con {n} chunks")
+
 
 def refresh_bm25() -> None:
-    """
-    Refresca BM25 usando el último cfg conocido (_CFG).
-    Si no hay _CFG, informa no-op.
-    """
-    if _CFG:
-        log.info("Refrescando BM25 con cfg actual…")
-        init_bm25(_CFG)
+    if _BM25_READY:
+        log.info("BM25: ya estaba inicializado (no-op).")
     else:
-        log.info("BM25: no hay cfg cargado; llamá init_bm25(cfg).")
+        log.info("BM25: no inicializado; llamá init_bm25(cfg).")
 
-def get_ensemble_retriever(domains: Optional[List[str]] = None,
-                           k_override: Optional[int] = None) -> Runnable:
+
+def get_ensemble_retriever(
+    domains: Optional[List[str]] = None,
+    k_override: Optional[int] = None,
+    user_id: Optional[str] = None,
+) -> Runnable:
     """
     Devuelve un retriever híbrido (BM25 + Vector) como Runnable.invoke(query)->List[Document].
-    Lee pesos de settings.yaml: retrieval.ensemble_weights = [w_lex, w_dense]
-    Lee top-k: retrieval.k (con env override RAG_TOPK) y parámetro k_override.
+    Filtra privados: owner == user_id; públicos: owner ausente.
     """
-    # --- config: k y pesos ---
-    def _read_k() -> int:
-        if isinstance(k_override, int) and k_override > 0:
-            return k_override
-        try:
-            env_k = int(os.environ.get("RAG_TOPK", "0"))
-        except Exception:
-            env_k = 0
-        if env_k > 0:
-            return env_k
-        try:
-            return int((_CFG.get("retrieval") or {}).get("k", 8))
-        except Exception:
-            return 8
-
-    def _read_weights() -> Tuple[float, float]:
-        w = (_CFG.get("retrieval") or {}).get("ensemble_weights")
-        if isinstance(w, (list, tuple)) and len(w) == 2:
-            try:
-                w_lex, w_dense = float(w[0]), float(w[1])
-            except Exception:
-                w_lex, w_dense = 0.5, 0.5
-        else:
-            # env override: RAG_WEIGHTS="0.6,0.4"
-            env = os.environ.get("RAG_WEIGHTS")
-            if env and "," in env:
-                try:
-                    a, b = env.split(",", 1)
-                    w_lex, w_dense = float(a), float(b)
-                except Exception:
-                    w_lex, w_dense = 0.5, 0.5
-            else:
-                w_lex, w_dense = 0.5, 0.5
-        # normalizar si no suman ~1
-        s = w_lex + w_dense
-        if s <= 0:
-            return 0.5, 0.5
-        return (w_lex / s, w_dense / s)
-
-    k = _read_k()
-    w_lex, w_dense = _read_weights()
-
-    # --- wrappers ---
     class _VectorWrapper(Runnable):
-        def __init__(self, vs, k: int, domains: Optional[List[str]]):
+        def __init__(self, vs, k: int, domains: Optional[List[str]], user_id: Optional[str]):
             self.vs = vs
             self.k = k
             self.domains = domains or None
+            self.user_id = user_id
+
+        def _post_filter_owner(self, docs: List[Document]) -> List[Document]:
+            if not self.user_id:
+                # sólo públicos o sin owner
+                return [d for d in docs if (d.metadata or {}).get("owner") in (None, "",)]
+            # públicos + míos
+            return [d for d in docs if (d.metadata or {}).get("owner") in (None, "", self.user_id)]
 
         def invoke(self, query: str, config: Optional[dict] = None) -> List[Document]:
             if self.vs is None:
                 return []
             search_kwargs = {"k": self.k}
+            # Intento de filtro por dominio (y tal vez owner si backend lo soporta)
+            filt: Dict[str, Any] = {}
             if self.domains:
-                # Chroma admite filtros de la forma {"domain":{"$in":[...]}}
-                search_kwargs["filter"] = {"domain": {"$in": self.domains}}
+                filt["domain"] = {"$in": self.domains}
+            # Muchos backends no soportan OR; por eso hacemos post-filter
+            if filt:
+                search_kwargs["filter"] = filt
             try:
                 retr = self.vs.as_retriever(search_kwargs=search_kwargs)
             except Exception:
                 retr = self.vs.as_retriever(search_kwargs={"k": self.k})
+
             # Camino moderno
+            docs: List[Document] = []
             if hasattr(retr, "invoke"):
-                return retr.invoke(query)
-            # Legacy
-            if hasattr(retr, "get_relevant_documents"):
-                return retr.get_relevant_documents(query)
-            # Último recurso
-            try:
-                return retr.invoke({"query": query})
-            except Exception:
-                return []
+                docs = retr.invoke(query)
+            elif hasattr(retr, "get_relevant_documents"):
+                docs = retr.get_relevant_documents(query)
+            else:
+                try:
+                    docs = retr.invoke({"query": query})
+                except Exception:
+                    docs = []
+
+            return self._post_filter_owner(docs)
 
     class _BM25Wrapper(Runnable):
-        def __init__(self, k: int, domains: Optional[List[str]]):
+        def __init__(self, k: int, domains: Optional[List[str]], user_id: Optional[str]):
             self.k = k
             self.domains = set(domains) if domains else None
+            self.user_id = user_id
 
         def _score(self, q_toks: List[str], d_toks: List[str]) -> float:
             score = 0.0
@@ -287,13 +277,12 @@ def get_ensemble_retriever(domains: Optional[List[str]] = None,
                 freqs[t] = freqs.get(t, 0) + 1
             dl = len(d_toks)
             for t in q_toks:
-                df = _BM25_DF.get(t)
-                if df is None:
+                if t not in _BM25_IDF:
                     continue
-                idf = math.log(1 + (len(_BM25_TOKS) - df + 0.5) / (df + 0.5))
                 f = freqs.get(t, 0)
                 if f == 0:
                     continue
+                idf = _BM25_IDF[t]
                 num = f * (_BM25_K1 + 1)
                 den = f + _BM25_K1 * (1 - _BM25_B + _BM25_B * dl / max(1.0, _BM25_AVGDL))
                 score += idf * (num / max(1e-9, den))
@@ -305,13 +294,24 @@ def get_ensemble_retriever(domains: Optional[List[str]] = None,
             q_toks = _tokenize(query)
             scored: List[Tuple[float, int]] = []
             for i, (doc, toks) in enumerate(zip(_BM25_DOCS, _BM25_TOKS)):
+                # Filtro por dominio
                 if self.domains:
                     dom = (doc.metadata or {}).get("domain")
                     if dom not in self.domains:
                         continue
+                # Filtro por owner (público o mío)
+                owner = (doc.metadata or {}).get("owner")
+                if self.user_id:
+                    if owner not in (None, "", self.user_id):
+                        continue
+                else:
+                    if owner not in (None, ""):
+                        continue
+
                 s = self._score(q_toks, toks)
                 if s > 0:
                     scored.append((s, i))
+
             scored.sort(reverse=True, key=lambda x: x[0])
             out: List[Document] = []
             for s, i in scored[: self.k]:
@@ -321,8 +321,12 @@ def get_ensemble_retriever(domains: Optional[List[str]] = None,
                 out.append(Document(page_content=d.page_content, metadata=md))
             return out
 
-    vec = _VectorWrapper(_VS, k, domains)
-    lex = _BM25Wrapper(k, domains)
+    # --- Pesos y top-k ---
+    k = int(k_override or 0) or int(os.environ.get("RAG_TOPK", "0")) or 8
+    w_lex, w_dense = 0.5, 0.5  # simple (si querés, leelos de cfg fuera de este módulo)
+
+    vec = _VectorWrapper(_VS, k, domains, user_id)
+    lex = _BM25Wrapper(k, domains, user_id)
 
     class _Ensemble(Runnable):
         def __init__(self, vec_r: Runnable, lex_r: Runnable, k: int, w_lex: float, w_dense: float):
@@ -331,18 +335,6 @@ def get_ensemble_retriever(domains: Optional[List[str]] = None,
             self.k = k
             self.w_lex = w_lex
             self.w_dense = w_dense
-
-        def _norm_scores(self, docs: List[Document], key: str) -> Dict[str, float]:
-            vals = [float(d.metadata.get(key)) for d in docs if d.metadata and isinstance(d.metadata.get(key), (int, float))]
-            if not vals:
-                return {}
-            mx = max(vals) or 1.0
-            out: Dict[str, float] = {}
-            for d in docs:
-                s = d.metadata.get(key)
-                if isinstance(s, (int, float)):
-                    out[_hash_key(d.metadata.get("source", "unk"), d.page_content)] = float(s) / mx
-            return out
 
         def invoke(self, query: str, config: Optional[dict] = None) -> List[Document]:
             # Obtener listas
@@ -357,38 +349,55 @@ def get_ensemble_retriever(domains: Optional[List[str]] = None,
                 log.warning(f"BM25 retriever falló: {e}")
                 ldocs = []
 
-            # Normalización / proxies
-            vkeys = {}  # rank inverso como proxy (vector stores no traen score)
+            # Normalizar scores
+            def _norm_scores(docs: List[Document], key: str) -> Dict[str, float]:
+                vals = []
+                for d in docs:
+                    s = (d.metadata or {}).get(key)
+                    if isinstance(s, (int, float)):
+                        vals.append(float(s))
+                if not vals:
+                    return {}
+                mx = max(vals) or 1.0
+                out = {}
+                for d in docs:
+                    s = (d.metadata or {}).get(key)
+                    if isinstance(s, (int, float)):
+                        out[_hash_key((d.metadata or {}).get("source", "unk"), d.page_content)] = float(s) / mx
+                return out
+
+            # Vector: proxy por rank inverso
+            vkeys = {}
             for rank, d in enumerate(vdocs, start=1):
-                vkeys[_hash_key(d.metadata.get("source", "unk"), d.page_content)] = 1.0 / rank
+                key = _hash_key((d.metadata or {}).get("source", "unk"), d.page_content)
+                vkeys[key] = 1.0 / rank
 
-            lnorm = self._norm_scores(ldocs, "score")
+            lnorm = _norm_scores(ldocs, "score")
 
-            # Fusión + de-dup
+            # Fusión
             scores: Dict[str, float] = {}
             pool: Dict[str, Document] = {}
 
             def _merge(docs: List[Document], weight: float, prox_scores: Dict[str, float], meta_score_key: Optional[str] = None):
                 for d in docs:
-                    key = _hash_key(d.metadata.get("source", "unk"), d.page_content)
+                    key = _hash_key((d.metadata or {}).get("source", "unk"), d.page_content)
                     pool[key] = d
                     s = prox_scores.get(key)
-                    if s is None and meta_score_key and d.metadata.get(meta_score_key) is not None:
-                        s = float(d.metadata[meta_score_key])
+                    if s is None and meta_score_key and (d.metadata or {}).get(meta_score_key) is not None:
+                        s = float((d.metadata or {})[meta_score_key])
                     if s is None:
                         s = 0.0
                     scores[key] = scores.get(key, 0.0) + weight * s
 
-            _merge(ldocs, self.w_lex, lnorm, meta_score_key="score")
-            _merge(vdocs, self.w_dense, vkeys, meta_score_key=None)
+            _merge(ldocs, w_lex, lnorm, meta_score_key="score")
+            _merge(vdocs, w_dense, vkeys, meta_score_key=None)
 
-            # Ordenar y cortar top-k
             ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
             out: List[Document] = []
             for key, _ in ranked[: self.k]:
                 d = pool[key]
                 md = dict(d.metadata or {})
-                md["score"] = float(scores[key])  # score combinado
+                md["score"] = float(scores[key])
                 out.append(Document(page_content=d.page_content, metadata=md))
             return out
 

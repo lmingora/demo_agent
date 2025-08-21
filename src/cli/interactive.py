@@ -32,17 +32,31 @@ def banner():
     return "Pipeline LangGraph (Supervisor) — (:help para ver comandos, incluye :index_docs)"
 
 def handle_cmd_index(cfg: Dict[str, Any], msg: str) -> str:
+    """
+    Uso:
+        :index <ruta_o_archivo> [owner=<user_id>]
+    Si se pasa owner=..., se guarda en metadata.owner.
+    """
     parts = msg.split()
     if len(parts) < 2:
-        return "Uso: :index <ruta-archivo> [dominio]"
-    path = parts[1]
-    domain = parts[2] if len(parts) > 2 else "general"
-    res = index_path(cfg, path, domain)
+        return "Uso: :index <ruta_o_archivo> [owner=<user_id>]"
+    path = parts[1].strip()
+    owner = None
+
+    # parsea argumentos extra como owner=xxx
+    for token in parts[2:]:
+        if token.startswith("owner="):
+            owner = token.split("=", 1)[1].strip()
+
+    from src.indexing.index import index_path
     try:
-        refresh_bm25(cfg, domain)
+        n_chunks = index_path(path, cfg, owner=owner)
+        if owner:
+            return f"Indexados {n_chunks} chunks desde {path} (owner={owner})"
+        else:
+            return f"Indexados {n_chunks} chunks desde {path}"
     except Exception as e:
-        log.warning(f"BM25 refresh fallo: {e}")
-    return res
+        return f"Error indexando {path}: {e}"
 
 def handle_cmd_index_docs(cfg: Dict[str, Any], msg: str) -> str:
     """

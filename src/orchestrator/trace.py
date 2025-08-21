@@ -1,8 +1,42 @@
 # src/orchestrator/trace.py
 from __future__ import annotations
-import logging, re
-from typing import Any, Dict, List, Tuple
-from langchain_core.messages import BaseMessage
+
+import logging
+import re
+from typing import Any, Dict, List, Tuple, Optional
+from uuid import uuid4
+
+from langchain_core.messages import BaseMessage, SystemMessage
+
+from src.rag.toolbox import rag_probe_counts, list_domains
+
+
+# ------------------------ Trace IDs & Hints ------------------------ #
+def make_trace_id() -> str:
+    """ID corto para trazar un turno."""
+    return uuid4().hex[:12]
+
+
+def trace_header_message(trace_id: str) -> SystemMessage:
+    """Header de traza que viaja en el prompt."""
+    return SystemMessage(content=f"[TRACE_ID] {trace_id}")
+
+
+def router_hint_message(user_text: str) -> Optional[SystemMessage]:
+    """
+    Pista barata para el supervisor: cuenta hits por dominio con top-k chico.
+    No decide la ruta; solo da contexto.
+    """
+    try:
+        doms = list_domains()
+        hits: Dict[str, int] = rag_probe_counts(query=user_text, domains=doms, k=3) or {}
+    except Exception:
+        hits = {}
+    if not hits:
+        return None
+    hint = "[ROUTER_HINT] " + ", ".join(f"{k}={v}" for k, v in hits.items())
+    return SystemMessage(content=hint)
+
 
 # ------------------------ Helpers de texto ------------------------ #
 def extract_text_from_messages(messages: List[BaseMessage]) -> str:
@@ -28,17 +62,20 @@ def extract_text_from_messages(messages: List[BaseMessage]) -> str:
     except Exception:
         return str(m)
 
+
 def peek_node_preview(node_payload: dict, max_len: int = 120) -> str:
     msgs = node_payload.get("messages", [])
     txt = extract_text_from_messages(msgs)
     txt = txt.replace("\n", " ").strip()
     return (txt[:max_len] + "…") if len(txt) > max_len else txt
 
+
 # ------------------------ Supervisor routing parse ------------------------ #
 _RE_TRANSFER = re.compile(
     r"(?:transfer_to|handoff_to)_([A-Za-z0-9_\-]+)(?:\s*\(\s*reason\s*=\s*['\"](.*?)['\"]\s*\))?",
     re.S,
 )
+
 
 def parse_supervisor_decision(text: str) -> Tuple[str | None, str | None]:
     if not text:
@@ -47,6 +84,7 @@ def parse_supervisor_decision(text: str) -> Tuple[str | None, str | None]:
     if not m:
         return None, None
     return (m.group(1) or None, m.group(2) or None)
+
 
 # ------------------------ Runner con stream ------------------------ #
 def run_with_trace(app, payload, thread_id: str):

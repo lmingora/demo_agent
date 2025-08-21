@@ -5,6 +5,7 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from src.llm.embeddings import make_cached_embeddings
 from src.utils.logging import get_logger
+from chromadb.config import Settings as ChromaSettings
 
 log = get_logger("rag.vectorstores")
 
@@ -47,11 +48,16 @@ def make_vectorstore(cfg: Dict[str, Any]):
     emb = make_cached_embeddings(cfg)
     log.info(f"Vectorstore Chroma(collection={collection}, dir={persist_directory})")
     try:
-        return Chroma(
+        client_settings = ChromaSettings(anonymized_telemetry=False)
+        db = Chroma(
             collection_name=collection,
             embedding_function=emb,
             persist_directory=persist_directory,
+            client_settings=client_settings,
         )
+        log.info(f"Vectorstore Chroma(collection={collection}, dir={persist_directory})")
+
+        return db
     except Exception as e:
         log.error(f"Error creando Chroma: {e}")
         raise
