@@ -8,6 +8,8 @@ from src.rag.toolbox import rag_search
 from src.agents.tools.structure_tools import summarize_evidence
 from src.orchestrator.evidence import get_evidence  # ← evidencia real por trace_id
 
+from src.orchestrator.event_bus import get_evidence_context_md
+
 _ACTION_RE = re.compile(r"Action:\s*(\w+)\s*[\r\n]+Action Input:\s*(\{.*?\})", re.S)
 
 def _try_json(s: str) -> dict:
@@ -124,3 +126,49 @@ def rewrite_sources_to_local(answer: str, results_or_trace_evidence: List[dict] 
         text = text + "\n\n" + block
 
     return text
+
+def verify_and_repair(answer_text: str, user_text: str, cfg: dict, trace_id: str | None) -> str:
+    """
+    Verifica la respuesta contra la evidencia local registrada en el turno (trace_id).
+    - Remueve afirmaciones no soportadas por la evidencia.
+    - Fuerza sección 'Fuentes' a documentos locales (o '—' si no hay).
+    - Si no hay evidencia local, pide que el modelo lo declare en forma honesta.
+    """
+    ev_md = get_evidence_context_md(trace_id) or ""
+    # Si no hay evidencia, al menos fuerza el disclaimer
+    if not ev_md.strip():
+        # Normalizamos “Fuentes”
+        fixed = answer_text
+        # Quitar URLs externas si quedaron
+        fixed = rewrite_sources_to_local(fixed, user_text, cfg, trace_id=trace_id)
+        # Asegurar sección Fuentes
+        if "Fuentes" not in fixed:
+            fixed += "\n\nFuentes: —"
+        return fixed
+
+    llm = make_chat(cfg)
+    prompt = f"""
+Vas a verificar y, si hace falta, reescribir una respuesta para que:
+1) No incluya afirmaciones factuales que NO estén soportadas por la evidencia de abajo.
+2) Las **Fuentes** sean SOLO documentos locales que estén en la evidencia (usa el nombre del archivo/metadata.path). Si no hay, escribe 'Fuentes: —'.
+3) Si falta evidencia para alguna parte, di explícitamente que no se encontró evidencia local para eso.
+
+[CONSULTA DEL USUARIO]
+{user_text}
+
+[RESPUESTA ORIGINAL]
+{answer_text}
+
+[EVIDENCIA LOCAL (fragmentos)]
+{ev_md}
+
+Devuelve solo la respuesta reescrita (sin explicaciones).
+"""
+    out = llm.invoke([HumanMessage(content=prompt)])
+    fixed = getattr(out, "content", None) or str(out)
+    # Sanea por si quedaron URLs externas
+    fixed = rewrite_sources_to_local(fixed, user_text, cfg, trace_id=trace_id)
+    # Asegurar sección Fuentes
+    if "Fuentes" not in fixed:
+        fixed += "\n\nFuentes: —"
+    return fixed

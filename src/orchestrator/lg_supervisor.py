@@ -95,18 +95,17 @@ def _build_worker(agent_cfg: Dict[str, Any], cfg: Dict[str, Any]) -> Any:
     except Exception as e:
         log.error(f"Error construyendo worker {agent_cfg.get('name')}: {e}")
         raise
-
-
+    
 def _make_supervisor_prompt(agent_names: List[str], cfg: Dict[str, Any]) -> str:
     """
     Prompt del supervisor SIN reglas duras.
     - Whitelist derivada de agents.yaml
     - Tabla dinámica con (Agente / Rol / Dominios)
     - Few-shots canónicos (1 por agente) auto-derivados
+    - Thought = 1 línea con el MOTIVO del ruteo (lo usamos como 'reason')
     """
     # --- 1) Whitelist/tabla (derivada de cfg["agents"]) ---
     agents_cfg = cfg.get("agents", []) or []
-    # Mapear name -> (role, domains)
     rows = []
     for a in agents_cfg:
         name = a.get("name", "").strip()
@@ -118,20 +117,25 @@ def _make_supervisor_prompt(agent_names: List[str], cfg: Dict[str, Any]) -> str:
 
     whitelist_str = ", ".join([r[0] for r in rows]) if rows else ", ".join(agent_names)
 
-    # tabla markdown
     table_lines = ["| Agente | Rol | Dominios |", "|---|---|---|"]
     for name, role, doms in rows:
         table_lines.append(f"| {name} | {role} | {doms} |")
     table_md = "\n".join(table_lines)
 
-    # --- 2) Few-shots canónicos (derivados por nombre; fallback genérico) ---
-    #   Nota: no incrustamos “reglas”; sólo ejemplos de entrada → handoff correcto.
+    # --- 2) Few-shots canónicos (pregunta + motivo por agente) ---
     CANON_Q = {
         "rag_general":       "¿Qué es un pipeline en ingeniería de software y para qué sirve?",
         "career_coach":      "Necesito feedback 360 para mi evaluación. Dame 3 pasos prácticos para pedirlo.",
         "career_planner":    "Armá un plan 30/60/90 para mi onboarding como backend en microservicios.",
         "incident_analyst":  "Tuvimos un incidente sev2 con 12 minutos de downtime hoy. Aplicá 5 porqués y da mitigaciones.",
         "evaluador":         "Evaluá este plan: mejorar release cycle en 6 semanas. Dame fortalezas, áreas de mejora, 30/60/90 y riesgos.",
+    }
+    CANON_REASON = {
+        "rag_general":       "pregunta general/definición técnica",
+        "career_coach":      "pide coaching/feedback 360",
+        "career_planner":    "pide plan 30/60/90",
+        "incident_analyst":  "léxico de incidentes (sev/downtime/postmortem)",
+        "evaluador":         "pide evaluar un plan con fortalezas/áreas/30-60-90/riesgos",
     }
 
     def _fallback_q(a: Dict[str, Any]) -> str:
@@ -143,27 +147,36 @@ def _make_supervisor_prompt(agent_names: List[str], cfg: Dict[str, Any]) -> str:
             return "Quiero mejorar mi desempeño. Sugiéreme 3 acciones prácticas."
         return "Necesito una explicación breve y un ejemplo concreto."
 
+    def _fallback_reason(a: Dict[str, Any]) -> str:
+        doms = a.get("domains") or ["general"]
+        dom = doms[0]
+        if dom in ("incident", "incidents"):
+            return "léxico de incidentes"
+        if dom == "career":
+            return "tema de carrera"
+        return "consulta general"
+
     # Formato ReAct estricto esperado para el supervisor
-    def _supervisor_action(agent: str) -> str:
+    def _supervisor_action(agent: str, reason_line: str) -> str:
+        # Thought = 1 línea con el motivo concreto (esto es lo que parseamos como 'reason')
         return (
-            f"Thought: El mensaje corresponde a {agent}.\n"
+            f"Thought: {reason_line}\n"
             f"Action: transfer_to_{agent}\n"
             f"Action Input: {{}}"
         )
 
     fewshots_blocks: List[str] = []
-    # seguimos el orden del grafo (agent_names)
     by_name = {a.get("name"): a for a in agents_cfg}
     for name in agent_names:
         a = by_name.get(name, {"name": name})
         q = CANON_Q.get(name) or _fallback_q(a)
+        r = CANON_REASON.get(name) or _fallback_reason(a)
         fewshots_blocks.append(
-            f"Usuario: {q}\n{_supervisor_action(name)}"
+            f"Usuario: {q}\n{_supervisor_action(name, r)}"
         )
-
     fewshots_md = "\n\n".join(fewshots_blocks)
 
-    # --- 3) Prompt final del supervisor (sin reglas heurísticas) ---
+    # --- 3) Prompt final del supervisor (sin reglas heurísticas duras) ---
     return (
         "Eres el **SUPERVISOR** del orquestador. Tu tarea es elegir el agente adecuado "
         "y delegar con una sola herramienta de handoff.\n\n"
@@ -173,17 +186,15 @@ def _make_supervisor_prompt(agent_names: List[str], cfg: Dict[str, Any]) -> str:
         "REGLAS ESTRICTAS:\n"
         "1) NO hables con el usuario ni generes prosa.\n"
         "2) Usa EXCLUSIVAMENTE el formato ReAct de tools:\n"
-        "   Thought: <breve razonamiento>\n"
+        "   Thought: <motivo de ruteo en UNA línea>\n"
         "   Action: transfer_to_<agente>\n"
         "   Action Input: {}\n"
         "3) NO agregues argumentos (Action Input DEBE ser {}).\n"
         "4) Si dudas, usa 'rag_general'. PROHIBIDO inventar nombres.\n\n"
         "EJEMPLOS (uno por agente):\n"
         f"{fewshots_md}\n\n"
-        "Responde SIEMPRE con ese bloque Action/Action Input y nada más."
+        "Responde SIEMPRE con ese bloque Thought + Action/Action Input y nada más."
     )
-
-
 
 def _ensure_unique_names(agents_cfg: List[Dict[str, Any]]) -> None:
     names: List[str] = []

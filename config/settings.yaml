@@ -48,3 +48,22 @@ memory:
   ttl_days: 30
   half_life_days: 14
   max_items: 500
+
+features:
+  sqlite_checkpoint: true
+  sqlite_checkpoint_path: "cache/checkpoints.sqlite3"
+
+observability:
+  prometheus:
+    enabled: true
+    port: 9090
+  pii_scrub: true
+
+cli:
+  stream_default: true
+  evidence_default: false
+
+ingest:
+  watch:
+    enabled: false     # activamos en MVP-I
+    polling_ms: 1500

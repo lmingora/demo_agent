@@ -77,14 +77,36 @@ _RE_TRANSFER = re.compile(
 )
 
 
+_RE_THOUGHT = re.compile(r"Thought:\s*(.+)")
+
 def parse_supervisor_decision(text: str) -> Tuple[str | None, str | None]:
+    """
+    Extrae (agent, reason) desde:
+      - Action: transfer_to_<agente>  (obligatorio)
+      - reason: si viene inline (transfer_to_xxx(reason='...')) o,
+                si no, tomamos el contenido del 'Thought:' (1 línea).
+    """
     if not text:
         return None, None
-    m = _RE_TRANSFER.search(text)
-    if not m:
-        return None, None
-    return (m.group(1) or None, m.group(2) or None)
 
+    agent = None
+    reason = None
+
+    m = _RE_TRANSFER.search(text)
+    if m:
+        agent = m.group(1) or None
+        # si venía inline (no lo esperamos, pero soportamos)
+        if m.lastindex and m.group(2):
+            reason = m.group(2)
+
+    if reason is None:
+        # fallback: tomar la línea del Thought
+        mt = _RE_THOUGHT.search(text)
+        if mt:
+            # una sola línea, ya trimmed
+            reason = mt.group(1).strip()
+
+    return agent, reason
 
 # ------------------------ Runner con stream ------------------------ #
 def run_with_trace(app, payload, thread_id: str):

@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 # Anti-alucinación (forzado + saneo de fuentes locales)
+
 from src.orchestrator.anti_hallucination import (
     maybe_force_tool_execution,
     rewrite_sources_to_local,
+    verify_and_repair,        # <--- NUEVO
 )
-
 from src.orchestrator.evidence import get_evidence
 
 # --- bootstrap para permitir `python -m src.main` o `python src/main.py` ---
@@ -155,11 +156,16 @@ def main() -> int:
                     if forced:
                         # Reescribe/inyecta fuentes LOCALES reales del trace actual
                         forced = rewrite_sources_to_local(forced, get_evidence(sess.trace_id))
+                        # 2) verifica contra evidencia y repara si hace falta
+                        forced = verify_and_repair(forced, msg, cfg, trace_id=trace_id)
+
                         print(f"[forced-tools→{target}] {forced}")
                         continue
 
                     # Saneamos fuentes (solo locales, basadas en evidencia real)
                     answer = rewrite_sources_to_local(answer, get_evidence(sess.trace_id))
+                    answer = verify_and_repair(answer, msg, cfg, trace_id=trace_id)
+
                     print(f"[dispatch→{target}] {answer}")
                     continue
                 except Exception as fe:
@@ -173,11 +179,15 @@ def main() -> int:
         forced = maybe_force_tool_execution(answer, msg, cfg)
         if forced:
             forced = rewrite_sources_to_local(forced, get_evidence(sess.trace_id))
+            forced = verify_and_repair(forced, msg, cfg, trace_id=trace_id)
+
             print(f"[forced-tools] {forced}")
             continue
 
         # Saneador final: quitar URLs externas/“inventadas” y citar SOLO evidencia local
         answer = rewrite_sources_to_local(answer, get_evidence(sess.trace_id))
+        # Verificación/repair final (mantiene consistencia con evidencia)
+        answer = verify_and_repair(answer, msg, cfg, trace_id=trace_id)
 
         if last_agent:
             print(f"[agente={last_agent}] {answer}")
