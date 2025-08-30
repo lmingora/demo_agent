@@ -1,30 +1,54 @@
 # src/orchestrator/event_bus.py
 from __future__ import annotations
-from typing import Dict, List
+from typing import List, Optional
+import warnings
 
-# Memoria en-proceso por trace_id
-_EVIDENCE_BY_TRACE: Dict[str, List[dict]] = {}
-_CURRENT_TRACE_ID: str | None = None
+# Usamos evidence.py como fuente de verdad (thread-safe + ContextVar)
+from .evidence import (
+    set_current_trace_id as _set_current_trace_id,
+    get_current_trace_id as _get_current_trace_id,
+    record_evidence as _record_evidence_core,
+    get_evidence as _get_evidence_core,
+)
 
-def set_current_trace_id(tid: str | None) -> None:
-    global _CURRENT_TRACE_ID
-    _CURRENT_TRACE_ID = tid
+warnings.warn(
+    "src.orchestrator.event_bus está deprecado. Usa src.orchestrator.evidence como API canónica.    ",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
-def get_current_trace_id() -> str | None:
-    return _CURRENT_TRACE_ID
+# ----------------- API pública (compat) ----------------- #
+def set_current_trace_id1(tid: Optional[str]) -> None:
+    _set_current_trace_id(tid)
+    
+def set_current_trace_id(tid: Optional[str]) -> None:
+    _set_current_trace_id(tid)
 
-def record_evidence(trace_id: str | None, results: List[dict]) -> None:
-    if not trace_id or not results:
+def get_current_trace_id() -> Optional[str]:
+    return _get_current_trace_id()
+
+def record_evidence(trace_id: Optional[str], results: List[dict]) -> None:
+    """
+    Compatibilidad con la firma antigua de event_bus:
+    - event_bus: record_evidence(trace_id, results)
+    - evidence:  record_evidence(results, trace_id=None)
+    """
+    if not results:
         return
-    _EVIDENCE_BY_TRACE.setdefault(trace_id, []).extend(results)
+    _record_evidence_core(results, trace_id=trace_id)
 
-def get_evidence_results(trace_id: str | None) -> List[dict]:
-    if not trace_id:
-        return []
-    return list(_EVIDENCE_BY_TRACE.get(trace_id, []))
+def get_evidence_results(trace_id: Optional[str]) -> List[dict]:
+    """
+    Compat: en event_bus se llamaba get_evidence_results, en evidence es get_evidence.
+    """
+    return _get_evidence_core(trace_id)
 
-def get_evidence_context_md(trace_id: str | None, max_chars: int = 4000) -> str:
-    res = get_evidence_results(trace_id)
+def get_evidence_context_md(trace_id: Optional[str], max_chars: int = 4000) -> str:
+    """
+    Genera un Markdown breve con la evidencia para ese trace.
+    Se mantiene aquí para no forzar cambios en call-sites actuales.
+    """
+    res = _get_evidence_core(trace_id)
     if not res:
         return ""
     lines, used = [], 0
@@ -34,5 +58,6 @@ def get_evidence_context_md(trace_id: str | None, max_chars: int = 4000) -> str:
         piece = f"- [{i}] ({src}) {txt}"
         if used + len(piece) > max_chars:
             break
-        lines.append(piece); used += len(piece)
+        lines.append(piece)
+        used += len(piece)
     return "\n".join(lines)

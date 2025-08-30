@@ -4,6 +4,14 @@ from typing import Dict, Any
 from src.rag.toolbox import rag_search
 from src.agents.tools.structure_tools import summarize_evidence
 
+from src.orchestrator.evidence import get_current_trace_id, get_evidence
+
+if not get_evidence(get_current_trace_id()):
+    try:
+        rag_search.invoke({"query": "<reformulación breve del último mensaje>", "domains": ["incidents"]})
+    except Exception:
+        pass
+     
 def spec(agent_cfg: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
     Devuelve {prompt, tools} para create_react_agent.

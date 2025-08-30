@@ -14,4 +14,3 @@ vectorstores/
 test/
 .cache
 data/
-tools/

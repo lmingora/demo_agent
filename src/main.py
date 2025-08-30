@@ -55,6 +55,7 @@ from src.orchestrator.trace import (
     extract_text_from_messages,
 )
 
+    
 # Silenciar telemetría/ruido de librerías (Chroma, Posthog, urllib3)
 for _name in ("chromadb.telemetry", "posthog", "urllib3", "urllib3.connectionpool"):
     logging.getLogger(_name).setLevel(logging.ERROR)
@@ -63,6 +64,8 @@ os.environ.setdefault("ANONYMIZED_TELEMETRY", "false")
 os.environ.setdefault("CHROMA_TELEMETRY_ANONYMOUS", "false")
 
 EVIDENCE_ON = False  # toggle en CLI
+
+
 
 def _pretty_passages(passages, limit=4):
     out = []
@@ -78,6 +81,13 @@ def _pretty_passages(passages, limit=4):
 def main() -> int:
     # 1) Config global
     cfg: Dict[str, Any] = load_cfg()
+    #watcher
+    try:
+        from src.indexing.watch import start_in_background
+        start_in_background(cfg)
+    except Exception as e:
+        log = __import__("src.utils.logging", fromlist=["get_logger"]).utils.logging.get_logger("main")
+        log.warning(f"No se pudo iniciar watcher: {e}")
 
     # 2) Memoria (usa cfg["memory"] si existe)
     init_memory(cfg)

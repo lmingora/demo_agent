@@ -7,7 +7,7 @@ from src.utils.logging import get_logger
 from src.rag.vectorstores import make_vectorstore
 from src.rag import retrievers as _retr
 from src.orchestrator.evidence import record_evidence, get_current_trace_id
-
+from src.observability.metrics import inc
 log = get_logger("rag.toolbox")
 
 __all__ = [
@@ -107,21 +107,38 @@ def init_rag_tooling(cfg: Dict[str, Any]) -> None:
         pass
 
 
-def refresh_bm25(cfg: Optional[Dict[str, Any]] = None) -> None:
-    """Refresca/reinicializa los índices BM25."""
+def refresh_bm25(cfg: Optional[dict] = None, domain: Optional[str] = None) -> None:
+    """
+    Refresca los índices BM25. Tolerante a firmas antiguas:
+    - Si el impl soporta domain: lo usamos.
+    - Si no, llamamos sin domain.
+    - Nunca rompe el flujo (loggea warning).
+    """
     try:
-        if hasattr(_retr, "refresh_bm25") and callable(_retr.refresh_bm25):
-            _retr.refresh_bm25()
-            log.info("BM25 refrescado (via retrievers.refresh_bm25).")
-            return
-        if cfg is not None:
-            _retr.init_bm25(cfg)
-            log.info("BM25 reinicializado (via retrievers.init_bm25(cfg)).")
-            return
-        log.warning("refresh_bm25: no hay retrievers.refresh_bm25 y no se pasó cfg; BM25 no se actualizó.")
+        from src.rag import retrievers as _ret
     except Exception as e:
-        log.error(f"No se pudo refrescar BM25: {e}")
+        log.warning(f"BM25 refresh no disponible (no se pudo importar retrievers): {e}")
+        return
 
+    try:
+        # preferir firma con dominio si existe
+        if hasattr(_ret, "refresh_bm25"):
+            import inspect
+            sig = inspect.signature(_ret.refresh_bm25)
+            if "domain" in sig.parameters:
+                _ret.refresh_bm25(cfg=cfg, domain=domain)
+            else:
+                _ret.refresh_bm25(cfg)  # firma vieja
+        else:
+            log.warning("BM25 refresh no disponible: retrievers.refresh_bm25 no encontrado.")
+    except TypeError:
+        # fallback duro: intentar sin args
+        try:
+            _ret.refresh_bm25()
+        except Exception as e:
+            log.warning(f"BM25 refresh fallo (fallback): {e}")
+    except Exception as e:
+        log.warning(f"BM25 refresh fallo: {e}")
 
 # ---------------------------- Internals --------------------------------------
 
@@ -253,6 +270,8 @@ def rag_search(
             pass
 
     log.debug(f"RAG({domains or '*'}) uid={user_id or '-'} trace={tid or '-'} '{query[:60]}…' → {payload['count']} pasajes")
+    
+    inc(RAG_SEARCH_TOTAL)
     return payload
 # ---------------------------- Probe para Router -------------------------------
 

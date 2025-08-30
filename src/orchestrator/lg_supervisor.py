@@ -2,7 +2,8 @@
 from __future__ import annotations
 from typing import Dict, Any, List, Optional
 
-from langgraph_supervisor import create_supervisor
+from src.orchestrator.supervisor_shim import create_supervisor
+
 from langgraph.prebuilt import create_react_agent
 from langchain_core.tools import BaseTool
 
@@ -18,7 +19,8 @@ from src.agents.implementations import (
     incident_analyst as _incident_analyst,
     evaluador as _evaluador,
 )
-
+from src.orchestrator.handoff import make_handoff, log_handoff
+from src.orchestrator.event_bus import get_current_trace_id
 log = get_logger("orchestrator.supervisor")
 
 # Mapa nombre -> función spec()
@@ -208,6 +210,24 @@ def _ensure_unique_names(agents_cfg: List[Dict[str, Any]]) -> None:
         names.append(n)
     if dups:
         raise ValueError(f"Nombres de agentes duplicados: {sorted(set(dups))}. Deben ser únicos.")
+# --- Handoff callback (telemetría y log JSONL) ---
+def _on_handoff_cb(evt: Dict[str, Any]) -> None:
+    """
+    Telemetría liviana del handoff: persiste JSONL con trace_id.
+    Usado por el supervisor_shim. Si la lib real no soporta on_handoff, se ignora.
+    """
+    try:
+        ho = make_handoff(
+            worker=evt.get("worker", "unknown"),
+            reason=evt.get("reason", ""),
+            confidence=float(evt.get("confidence") or 0.0),
+            votes=evt.get("votes") or None,
+            dom_hits=evt.get("dom_hits") or None,
+        )
+        log_handoff(ho, trace_id=get_current_trace_id())
+    except Exception:
+        # best-effort: jamás romper el flujo por telemetría
+        pass
 
 
 def build_app(cfg: Dict[str, Any]) -> Any:
@@ -249,15 +269,20 @@ def build_app(cfg: Dict[str, Any]) -> Any:
     # 3) Prompt del supervisor
     sup_prompt = _make_supervisor_prompt(names, cfg)
 
+
+
+
+
     # 4) Crear supervisor (firma oficial: lista de workers)
+
     supervisor = create_supervisor(
         agents=workers,
         model=sup_llm,
         prompt=sup_prompt,
         handoff_tool_prefix=None,     # 'transfer_to_<name>' por defecto
         include_agent_name="inline",  # ayuda a preservar el name
+        on_handoff=_on_handoff_cb,    # <-- NUEVO: lo usa el shim; la lib real lo ignora si no lo soporta
     )
-
     # 5) Compilar (con o sin checkpointer SQLite)
     compiled = None
     if (cfg.get("features", {}) or {}).get("use_checkpointer_sqlite", False):

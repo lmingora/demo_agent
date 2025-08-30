@@ -6,12 +6,30 @@ from langchain_core.messages import HumanMessage
 from src.llm.factory import make_chat
 from src.rag.toolbox import rag_search
 from src.agents.tools.structure_tools import summarize_evidence
-from src.orchestrator.evidence import get_evidence  # ← evidencia real por trace_id
-
 from src.orchestrator.event_bus import get_evidence_context_md
 
 _ACTION_RE = re.compile(r"Action:\s*(\w+)\s*[\r\n]+Action Input:\s*(\{.*?\})", re.S)
+_FUENTES_HDR_RE = re.compile(r"(?mi)^\s*(\*\*?)?\s*fuentes(\s*\(.*?\))?\s*(\*\*?)?\s*:\s*$")
 
+def _strip_fuentes_block(md: str) -> str:
+    """
+    Elimina el heading 'Fuentes...' y las líneas de lista que le sigan.
+    Heurística conservadora para no dejar fuentes inventadas.
+    """
+    lines = (md or "").splitlines()
+    out = []
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if _FUENTES_HDR_RE.match(ln.strip()):
+            i += 1
+            # saltar lista siguiente (bullets o vacías)
+            while i < len(lines) and (not lines[i].strip() or lines[i].lstrip().startswith(("-", "*"))):
+                i += 1
+            continue
+        out.append(ln)
+        i += 1
+    return "\n".join(out).strip()
 def _try_json(s: str) -> dict:
     try:
         return json.loads(s)
@@ -151,14 +169,9 @@ def verify_and_repair(answer_text: str, user_text: str, cfg: dict, trace_id: str
     ev_md = get_evidence_context_md(trace_id) or ""
     # Si no hay evidencia, al menos fuerza el disclaimer
     if not ev_md.strip():
-        # Normalizamos “Fuentes”
-        fixed = answer_text
-        # Quitar URLs externas si quedaron
-        fixed = rewrite_sources_to_local(fixed, user_text, cfg, trace_id=trace_id)
-        
-        # Asegurar sección Fuentes
-        if "Fuentes" not in fixed:
-            fixed += "\n\nFuentes: —"
+        fixed = rewrite_sources_to_local(answer_text or "", user_text, cfg, trace_id=trace_id)
+        fixed = _strip_fuentes_block(fixed)
+        fixed = (fixed + "\n\n" if fixed else "") + "Fuentes: —"
         return fixed
 
     llm = make_chat(cfg)
@@ -183,7 +196,15 @@ Devuelve solo la respuesta reescrita (sin explicaciones).
     fixed = getattr(out, "content", None) or str(out)
     # Sanea por si quedaron URLs externas
     fixed = rewrite_sources_to_local(fixed, user_text, cfg, trace_id=trace_id)
-    # Asegurar sección Fuentes
-    if "Fuentes" not in fixed:
-        fixed += "\n\nFuentes: —"
+
+    # Construir bloque de fuentes reales (si hay evidencia)
+    ev_block = get_evidence_context_md(trace_id) or ""
+    fixed = _strip_fuentes_block(fixed)
+
+    if ev_block.strip():
+        fixed = (fixed + "\n\n" if fixed else "") + "**Fuentes (locales)**:\n" + ev_block
+    else:
+        # si no hay evidencia, deja disclaimer explícito
+        fixed = (fixed + "\n\n" if fixed else "") + "Fuentes: —"
+
     return fixed
