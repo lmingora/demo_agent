@@ -62,6 +62,17 @@ for _name in ("chromadb.telemetry", "posthog", "urllib3", "urllib3.connectionpoo
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "false")
 os.environ.setdefault("CHROMA_TELEMETRY_ANONYMOUS", "false")
 
+EVIDENCE_ON = False  # toggle en CLI
+
+def _pretty_passages(passages, limit=4):
+    out = []
+    for p in (passages or [])[:limit]:
+        src = p.get("source", "?")
+        txt = (p.get("text") or "").strip().replace("\n", " ")
+        if len(txt) > 100:
+            txt = txt[:100] + "..."
+        out.append(f"[{src}] {txt}")
+    return "\n".join(out)
 
 # -----------------------------------------------------------------------------
 def main() -> int:
@@ -155,7 +166,7 @@ def main() -> int:
                     forced = maybe_force_tool_execution(answer, msg, cfg)
                     if forced:
                         # Reescribe/inyecta fuentes LOCALES reales del trace actual
-                        forced = rewrite_sources_to_local(forced, get_evidence(sess.trace_id))
+                        forced = rewrite_sources_to_local(forced, msg, cfg, trace_id=trace_id, evidence=get_evidence(sess.trace_id))
                         # 2) verifica contra evidencia y repara si hace falta
                         forced = verify_and_repair(forced, msg, cfg, trace_id=trace_id)
 
@@ -163,7 +174,7 @@ def main() -> int:
                         continue
 
                     # Saneamos fuentes (solo locales, basadas en evidencia real)
-                    answer = rewrite_sources_to_local(answer, get_evidence(sess.trace_id))
+                    answer = rewrite_sources_to_local(answer, msg, cfg, trace_id=trace_id, evidence=get_evidence(sess.trace_id))
                     answer = verify_and_repair(answer, msg, cfg, trace_id=trace_id)
 
                     print(f"[dispatch→{target}] {answer}")
@@ -178,14 +189,15 @@ def main() -> int:
         # Anti-alucinación (forzado tools)
         forced = maybe_force_tool_execution(answer, msg, cfg)
         if forced:
-            forced = rewrite_sources_to_local(forced, get_evidence(sess.trace_id))
+            forced = rewrite_sources_to_local(forced, msg, cfg, trace_id=trace_id, evidence=get_evidence(sess.trace_id))
             forced = verify_and_repair(forced, msg, cfg, trace_id=trace_id)
 
             print(f"[forced-tools] {forced}")
             continue
 
         # Saneador final: quitar URLs externas/“inventadas” y citar SOLO evidencia local
-        answer = rewrite_sources_to_local(answer, get_evidence(sess.trace_id))
+       # answer = rewrite_sources_to_local(answer, get_evidence(sess.trace_id))
+        answer = rewrite_sources_to_local(answer, msg, cfg, trace_id=trace_id, evidence=get_evidence(sess.trace_id))
         # Verificación/repair final (mantiene consistencia con evidencia)
         answer = verify_and_repair(answer, msg, cfg, trace_id=trace_id)
 

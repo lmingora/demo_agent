@@ -1,18 +1,27 @@
 # src/orchestrator/router_hybrid.py
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Dict as TDict
 
 from semantic_router import SemanticRouter
 
-
 @dataclass
 class RouteDecision:
+    """
+    Decisión de enrutamiento del HybridRouter:
+      - agent: nombre del agente elegido (o None si no hay)
+      - confidence: score final (similitud + boost por evidencia)
+      - reason: explicación corta
+      - candidates: lista (agente, score) ordenada desc para telemetría/debug
+      - features: pistas útiles para el supervisor (p. ej. dominios del agente elegido)
+      - dom_hits: hits por dominio (si el probe aportó info)
+    """
     agent: Optional[str]
     confidence: float
     reason: str
-    candidates: List[Tuple[str, float]]  # para debug/telemetría
-
+    candidates: List[Tuple[str, float]]
+    features: List[str] = field(default_factory=list)
+    dom_hits: Optional[TDict[str, int]] = None
 
 class HybridRouter:
     """
@@ -67,15 +76,33 @@ class HybridRouter:
 
         scored.sort(key=lambda t: -t[1])
         best_name, best_score = scored[0]
-        reason = f"sem={sem_cand[0][1]:.2f}, evidence_boost={best_score - sem_cand[0][1]:.2f}, dom_hits={dom_hits}"
+        reason = (
+            f"sem={sem_cand[0][1]:.2f}, "
+            f"evidence_boost={best_score - sem_cand[0][1]:.2f}, "
+            f"dom_hits={dom_hits}"
+        )
+        features = self._agent_domains(best_name)  # pistas explícitas para el handoff
 
         # 4) umbral & fallback
         if best_score < self.threshold:
             # baja confianza → dejá que 'rag_general' maneje
-            return RouteDecision(agent="rag_general", confidence=best_score, reason=reason + " (fallback)", candidates=scored)
+            return RouteDecision(
+                agent="rag_general",
+                confidence=best_score,
+                reason=reason + " (fallback)",
+                candidates=scored,
+                features=features,
+                dom_hits=dom_hits,
+            )
 
-        return RouteDecision(agent=best_name, confidence=best_score, reason=reason, candidates=scored)
-
+        return RouteDecision(
+            agent=best_name,
+            confidence=best_score,
+            reason=reason,
+            candidates=scored,
+            features=features,
+            dom_hits=dom_hits,
+        )
 
 # Conveniencia (por si querés un builder rápido)
 def build_hybrid_router(

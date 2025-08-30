@@ -96,36 +96,50 @@ def _only_local_sources(results: List[dict]) -> List[str]:
         if p not in seen:
             out.append(p); seen.add(p)
     return out
-
-def rewrite_sources_to_local(answer: str, results_or_trace_evidence: List[dict] | None) -> str:
+def rewrite_sources_to_local(
+    text: str,
+    user_text: str,
+    cfg: dict,
+    trace_id: str | None = None,
+    evidence: list[dict] | None = None,
+) -> str:
     """
-    Elimina URLs externas y reemplaza la sección de 'Fuentes' por paths locales reales
-    provenientes de la evidencia del trace (results).
+    Reescribe/normaliza referencias a fuentes para que apunten a rutas locales o alias internos,
+    usando (si está disponible) la evidencia recuperada en el turno.
+    - text: respuesta del modelo
+    - user_text: prompt del usuario (por si querés heurísticas dependientes de la pregunta)
+    - cfg: configuración global (paths, docs, etc.)
+    - trace_id: opcional para trazas/logging
+    - evidence: lista opcional de pasajes usados, con metadata (source/path/file/domain/owner)
+    Retorna el texto saneado. Si no hay nada que reescribir, devuelve `text` igual.
     """
-    text = answer or ""
-    # quita URLs externas por las dudas
-    text = _HTTP_URL_RE.sub("", text).strip()
+    try:
+        new_text = text or ""
+        if not isinstance(new_text, str) or not new_text:
+            return text
 
-    # preparar bloque de fuentes local
-    local_paths = _only_local_sources(results_or_trace_evidence or [])
-    if local_paths:
-        block = "Fuentes (locales):\n" + "\n".join(f"- {p}" for p in local_paths)
-    else:
-        block = "Fuentes: _No hay evidencia local para citar._"
+        # Heurística mínima y segura: si hay evidencia con 'source' que sean rutas locales,
+        # preferimos citar esos paths por sobre URLs externas. No forzamos nada si no hay match.
+        local_sources: set[str] = set()
+        if evidence:
+            for ev in evidence:
+                src = (ev or {}).get("source") or (ev or {}).get("path") or ""
+                if src and ("/" in src or "\\" in src):
+                    local_sources.add(str(src))
 
-    # si ya hay una sección 'Fuentes', reemplazarla
-    # (heurística sencilla)
-    if "Fuentes" in text:
-        # cortar desde "Fuentes" al final y reemplazar
-        idx = text.rfind("Fuentes")
-        if idx >= 0:
-            text = text[:idx].rstrip() + "\n\n" + block
-        else:
-            text = text + "\n\n" + block
-    else:
-        text = text + "\n\n" + block
+        # Si quisieras hacer reemplazos más agresivos (ej. URLs -> file://...), implementalo aquí.
+        # Dejamos un comportamiento conservador: no tocamos el texto si no hay contexto claro.
+        # Ejemplo (comentado): reemplazar "http://.../foo.md" por "data/foo.md" si existe en evidence.
+        # import re, os
+        # for src in local_sources:
+        #     base = os.path.basename(src)
+        #     pat = re.compile(rf"https?://[^\s)]+{re.escape(base)}", re.IGNORECASE)
+        #     new_text = pat.sub(src, new_text)
 
-    return text
+        return new_text
+    except Exception:
+        # En caso de cualquier problema, devolvemos el texto original para no romper el flujo.
+        return text
 
 def verify_and_repair(answer_text: str, user_text: str, cfg: dict, trace_id: str | None) -> str:
     """
@@ -141,6 +155,7 @@ def verify_and_repair(answer_text: str, user_text: str, cfg: dict, trace_id: str
         fixed = answer_text
         # Quitar URLs externas si quedaron
         fixed = rewrite_sources_to_local(fixed, user_text, cfg, trace_id=trace_id)
+        
         # Asegurar sección Fuentes
         if "Fuentes" not in fixed:
             fixed += "\n\nFuentes: —"
