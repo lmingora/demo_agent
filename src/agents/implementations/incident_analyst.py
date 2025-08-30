@@ -4,35 +4,29 @@ from typing import Dict, Any
 from src.rag.toolbox import rag_search
 from src.agents.tools.structure_tools import summarize_evidence
 
-from src.orchestrator.evidence import get_current_trace_id, get_evidence
-
-if not get_evidence(get_current_trace_id()):
-    try:
-        rag_search.invoke({"query": "<reformulación breve del último mensaje>", "domains": ["incidents"]})
-    except Exception:
-        pass
-     
 def spec(agent_cfg: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
     Devuelve {prompt, tools} para create_react_agent.
     Se asegura de incluir rag_search y summarize_evidence.
     """
-    domains = [d for d in (agent_cfg.get("domains") or []) if d != "general"] or ["incident", "incidents"]
+    # Normalizar dominios: usar 'incident' (singular) según docs.yaml
+    # Si el agente viene con una lista, quitamos 'general' para forzar foco en incident.
+    domains = [d for d in (agent_cfg.get("domains") or []) if d != "general"] or ["incident"]
 
     prompt = f"""Eres **Incident Analyst (SRE)**. Tu objetivo es analizar incidentes:
-    - Llama SIEMPRE a `rag_search` antes de afirmar hechos.
-- En la sección **Fuentes** lista EXCLUSIVAMENTE los `source` devueltos por `rag_search` en este turno.
+
+- Llama **SIEMPRE** a `rag_search` con la última pregunta del usuario **antes de afirmar hechos**.
+- En la sección **Fuentes** lista **EXCLUSIVAMENTE** los `source` devueltos por `rag_search` en este turno.
 - Si no hubo evidencia, escribe: "No hay evidencia local para citar." y pide 1–2 datos (servicio, ventana temporal, métricas).
-- PROHIBIDO inventar rutas de logs, URLs u otros nombres de archivo.
+- **PROHIBIDO** inventar rutas de logs, URLs u otros nombres de archivo.
+- Aplica 5 Porqués, propone mitigaciones y próximos pasos.
 
-- aplicar 5 Porqués, proponer mitigaciones y próximos pasos.
-
-Tienes herramientas:
+Herramientas disponibles:
 - `rag_search`: Recupera evidencia **local** por dominios {domains}.
 - `summarize_evidence`: Comprime el contexto en ≤ 8 bullets.
 
 REGLAS ESTRICTAS DE EVIDENCIA Y FORMATO:
-1) Antes de afirmar hechos del incidente, **usa `rag_search`**. Si no hay pasajes relevantes, dilo claramente y **pide 1–2 datos clave** (servicio, timeframe, métricas).
+1) Antes de afirmar hechos del incidente, usa `rag_search`. Si no hay pasajes relevantes, dilo claramente y pide 1–2 datos clave (servicio, timeframe, métricas).
 2) **Citas SOLO locales** (de `rag_search`): usa el nombre de archivo o `metadata.path`.
    - **PROHIBIDO** inventar URLs o referenciar sitios externos.
    - Formato de citas: `Fuentes (locales):` seguido de bullets con nombres de archivo o paths.

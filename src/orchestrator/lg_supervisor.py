@@ -21,6 +21,8 @@ from src.agents.implementations import (
 )
 from src.orchestrator.handoff import make_handoff, log_handoff
 from src.orchestrator.event_bus import get_current_trace_id
+from src.orchestrator.probe_tools import probe_domains
+
 log = get_logger("orchestrator.supervisor")
 
 # Mapa nombre -> función spec()
@@ -187,15 +189,19 @@ def _make_supervisor_prompt(agent_names: List[str], cfg: Dict[str, Any]) -> str:
         f"{table_md}\n\n"
         "REGLAS ESTRICTAS:\n"
         "1) NO hables con el usuario ni generes prosa.\n"
-        "2) Usa EXCLUSIVAMENTE el formato ReAct de tools:\n"
-        "   Thought: <motivo de ruteo en UNA línea>\n"
+        "2) **Primero** llama a la tool `probe_domains` con la **última pregunta del usuario** para ver hits por dominio.\n"
+        "   - Llama: `Action: probe_domains` + `Action Input: {\"query\":\"<última_pregunta>\", \"domains\": [\"*\"], \"k_per_domain\": 3}`.\n"
+        "   - Usa su salida (hits por dominio y ejemplos de fuentes) COMO SEÑAL para elegir el agente.\n"
+        "3) **Luego** usa EXCLUSIVAMENTE el formato ReAct de handoff tools:\n"
+        "   Thought: <motivo de ruteo en UNA línea (p. ej. dominio con más hits)>\n"
         "   Action: transfer_to_<agente>\n"
         "   Action Input: {}\n"
-        "3) NO agregues argumentos (Action Input DEBE ser {}).\n"
-        "4) Si dudas, usa 'rag_general'. PROHIBIDO inventar nombres.\n\n"
+        "4) NO agregues argumentos al handoff (Action Input DEBE ser {}).\n"
+        "5) Si dudas, usa 'rag_general'. PROHIBIDO inventar nombres.\n\n"
         "EJEMPLOS (uno por agente):\n"
         f"{fewshots_md}\n\n"
-        "Responde SIEMPRE con ese bloque Thought + Action/Action Input y nada más."
+        "Responde SIEMPRE solo con bloques ReAct de tools. Secuencia esperada:\n"
+        "   (a) probe_domains → (b) transfer_to_<agente>."
     )
 
 def _ensure_unique_names(agents_cfg: List[Dict[str, Any]]) -> None:
@@ -272,6 +278,8 @@ def build_app(cfg: Dict[str, Any]) -> Any:
 
 
 
+    # --- Mapa agente→dominios para routing por recall (lo usa el shim) ---
+    agent_domain_map = {a["name"]: (a.get("domains") or ["general"]) for a in agents_cfg}
 
     # 4) Crear supervisor (firma oficial: lista de workers)
 
@@ -279,10 +287,13 @@ def build_app(cfg: Dict[str, Any]) -> Any:
         agents=workers,
         model=sup_llm,
         prompt=sup_prompt,
-        handoff_tool_prefix=None,     # 'transfer_to_<name>' por defecto
-        include_agent_name="inline",  # ayuda a preservar el name
-        on_handoff=_on_handoff_cb,    # <-- NUEVO: lo usa el shim; la lib real lo ignora si no lo soporta
+        tools=[probe_domains],           # ← NUEVO: el supervisor puede invocar la tool
+        handoff_tool_prefix=None,
+        include_agent_name="inline",
+        on_handoff=_on_handoff_cb,       # (lo tuyo)
+        agent_domain_map=agent_domain_map,  # (lo tuyo; lo consume el shim)
     )
+
     # 5) Compilar (con o sin checkpointer SQLite)
     compiled = None
     if (cfg.get("features", {}) or {}).get("use_checkpointer_sqlite", False):

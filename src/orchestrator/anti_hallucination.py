@@ -3,13 +3,17 @@ from __future__ import annotations
 import json, re
 from typing import Dict, List, Optional
 from langchain_core.messages import HumanMessage
+
 from src.llm.factory import make_chat
 from src.rag.toolbox import rag_search
 from src.agents.tools.structure_tools import summarize_evidence
-from src.orchestrator.event_bus import get_evidence_context_md
+from src.orchestrator.evidence import get_evidence, get_current_trace_id
 
+# Detecta un bloque ReAct de tool-call
 _ACTION_RE = re.compile(r"Action:\s*(\w+)\s*[\r\n]+Action Input:\s*(\{.*?\})", re.S)
-_FUENTES_HDR_RE = re.compile(r"(?mi)^\s*(\*\*?)?\s*fuentes(\s*\(.*?\))?\s*(\*\*?)?\s*:\s*$")
+
+# Encabezados de fuentes: "Fuentes", "[Fuentes]", "## Fuentes", "**Fuentes**:", etc.
+_FUENTES_HDR_RE = re.compile(r"(?mi)^\s*(\#*\s*)?(\[?\*?\*?)?\s*fuentes(\s*\(.*?\))?\s*(\*?\*\]?)?\s*:\s*$")
 
 def _strip_fuentes_block(md: str) -> str:
     """
@@ -30,11 +34,14 @@ def _strip_fuentes_block(md: str) -> str:
         out.append(ln)
         i += 1
     return "\n".join(out).strip()
+
+
 def _try_json(s: str) -> dict:
     try:
         return json.loads(s)
     except Exception:
         return json.loads(s.replace("'", '"'))
+
 
 def _results_to_context_md(results: List[dict], max_chars: int = 4000) -> str:
     if not results:
@@ -48,6 +55,7 @@ def _results_to_context_md(results: List[dict], max_chars: int = 4000) -> str:
             break
         lines.append(piece); used += len(piece)
     return "\n".join(lines)
+
 
 def maybe_force_tool_execution(answer_text: str, user_text: str, cfg: dict) -> Optional[str]:
     """
@@ -95,6 +103,7 @@ def maybe_force_tool_execution(answer_text: str, user_text: str, cfg: dict) -> O
     out = llm.invoke([HumanMessage(content=close_prompt)])
     return getattr(out, "content", None) or str(out)
 
+
 # --- saneo de fuentes basado en evidencia real del trace --- #
 _HTTP_URL_RE = re.compile(r"https?://\S+")
 
@@ -114,6 +123,8 @@ def _only_local_sources(results: List[dict]) -> List[str]:
         if p not in seen:
             out.append(p); seen.add(p)
     return out
+
+
 def rewrite_sources_to_local(
     text: str,
     user_text: str,
@@ -124,11 +135,6 @@ def rewrite_sources_to_local(
     """
     Reescribe/normaliza referencias a fuentes para que apunten a rutas locales o alias internos,
     usando (si está disponible) la evidencia recuperada en el turno.
-    - text: respuesta del modelo
-    - user_text: prompt del usuario (por si querés heurísticas dependientes de la pregunta)
-    - cfg: configuración global (paths, docs, etc.)
-    - trace_id: opcional para trazas/logging
-    - evidence: lista opcional de pasajes usados, con metadata (source/path/file/domain/owner)
     Retorna el texto saneado. Si no hay nada que reescribir, devuelve `text` igual.
     """
     try:
@@ -136,44 +142,32 @@ def rewrite_sources_to_local(
         if not isinstance(new_text, str) or not new_text:
             return text
 
-        # Heurística mínima y segura: si hay evidencia con 'source' que sean rutas locales,
-        # preferimos citar esos paths por sobre URLs externas. No forzamos nada si no hay match.
-        local_sources: set[str] = set()
-        if evidence:
-            for ev in evidence:
-                src = (ev or {}).get("source") or (ev or {}).get("path") or ""
-                if src and ("/" in src or "\\" in src):
-                    local_sources.add(str(src))
-
-        # Si quisieras hacer reemplazos más agresivos (ej. URLs -> file://...), implementalo aquí.
-        # Dejamos un comportamiento conservador: no tocamos el texto si no hay contexto claro.
-        # Ejemplo (comentado): reemplazar "http://.../foo.md" por "data/foo.md" si existe en evidence.
-        # import re, os
-        # for src in local_sources:
-        #     base = os.path.basename(src)
-        #     pat = re.compile(rf"https?://[^\s)]+{re.escape(base)}", re.IGNORECASE)
-        #     new_text = pat.sub(src, new_text)
-
+        # Heurística conservadora por ahora (no reemplazamos agresivo)
+        # Mantener aquí por si luego se implementan mapeos URL->path local.
         return new_text
     except Exception:
-        # En caso de cualquier problema, devolvemos el texto original para no romper el flujo.
         return text
+
 
 def verify_and_repair(answer_text: str, user_text: str, cfg: dict, trace_id: str | None) -> str:
     """
     Verifica la respuesta contra la evidencia local registrada en el turno (trace_id).
-    - Remueve afirmaciones no soportadas por la evidencia.
+    - Remueve/ajusta afirmaciones no soportadas por la evidencia.
     - Fuerza sección 'Fuentes' a documentos locales (o '—' si no hay).
-    - Si no hay evidencia local, pide que el modelo lo declare en forma honesta.
     """
-    ev_md = get_evidence_context_md(trace_id) or ""
-    # Si no hay evidencia, al menos fuerza el disclaimer
+    # Construimos la evidencia desde el store real (no event_bus)
+    tid = trace_id or get_current_trace_id()
+    ev_list = get_evidence(tid) or []
+    ev_md = _results_to_context_md(ev_list)
+
+    # Sin evidencia → disclaimer honesto
     if not ev_md.strip():
         fixed = rewrite_sources_to_local(answer_text or "", user_text, cfg, trace_id=trace_id)
         fixed = _strip_fuentes_block(fixed)
         fixed = (fixed + "\n\n" if fixed else "") + "Fuentes: —"
         return fixed
 
+    # Con evidencia → pedimos verificación/rewrite al LLM y luego normalizamos “Fuentes”
     llm = make_chat(cfg)
     prompt = f"""
 Vas a verificar y, si hace falta, reescribir una respuesta para que:
@@ -194,17 +188,10 @@ Devuelve solo la respuesta reescrita (sin explicaciones).
 """
     out = llm.invoke([HumanMessage(content=prompt)])
     fixed = getattr(out, "content", None) or str(out)
-    # Sanea por si quedaron URLs externas
-    fixed = rewrite_sources_to_local(fixed, user_text, cfg, trace_id=trace_id)
 
-    # Construir bloque de fuentes reales (si hay evidencia)
-    ev_block = get_evidence_context_md(trace_id) or ""
+    # Saneo final + “Fuentes (locales)” calculadas desde ev_md
+    fixed = rewrite_sources_to_local(fixed, user_text, cfg, trace_id=trace_id)
     fixed = _strip_fuentes_block(fixed)
 
-    if ev_block.strip():
-        fixed = (fixed + "\n\n" if fixed else "") + "**Fuentes (locales)**:\n" + ev_block
-    else:
-        # si no hay evidencia, deja disclaimer explícito
-        fixed = (fixed + "\n\n" if fixed else "") + "Fuentes: —"
-
+    fixed = (fixed + "\n\n" if fixed else "") + "**Fuentes (locales)**:\n" + ev_md
     return fixed

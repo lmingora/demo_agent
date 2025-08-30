@@ -1,6 +1,6 @@
 # src/rag/toolbox.py
 from __future__ import annotations
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Iterable
 
 from langchain_core.tools import tool
 from src.utils.logging import get_logger
@@ -8,6 +8,11 @@ from src.rag.vectorstores import make_vectorstore
 from src.rag import retrievers as _retr
 from src.orchestrator.evidence import record_evidence, get_current_trace_id
 from src.observability.metrics import inc
+
+import os, json, re, glob
+from pathlib import Path   # ← ESTA LÍNEA ES LA QUE FALTA
+
+
 log = get_logger("rag.toolbox")
 
 __all__ = [
@@ -30,6 +35,7 @@ def set_request_context(user_id: Optional[str], trace_id: Optional[str]) -> None
     global _CURRENT_USER_ID, _CURRENT_TRACE_ID
     _CURRENT_USER_ID = user_id
     _CURRENT_TRACE_ID = trace_id
+
 
 
 # VectorStore global (se setea en init_rag_tooling)
@@ -215,17 +221,8 @@ def rag_search(
     trace_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Busca pasajes relevantes combinando recuperación lexical (BM25) y vectorial (VectorStore).
-
-    Args:
-      query: Texto de consulta.
-      domains: Limitar búsqueda a uno o más dominios (p.ej. ["career","incident"]).
-      k: Override del top-k (si se omite, usa el de settings.yaml).
-      user_id: Si se pasa, permite a los retrievers filtrar owner/privado (si está implementado).
-      trace_id: Si se pasa, se usa para registrar evidencia; si no, se usa el contextvar actual.
-
-    Returns:
-      dict: {"results":[{"text","source","score","domain"},...], "count":N, "context_md": str}
+    Busca pasajes relevantes combinando recuperación vectorial y, como respaldo,
+    recuperación lexical on-disk (lee cache/bm25/<dom>.jsonl) para completar top-K.
     """
     # helper local para armar context_md corto y estable
     def _results_to_context_md(results: List[dict], max_chars: int = 4000) -> str:
@@ -238,30 +235,66 @@ def rag_search(
             piece = f"- [{i}] ({src}) {txt}"
             if used + len(piece) > max_chars:
                 break
-            lines.append(piece)
-            used += len(piece)
+            lines.append(piece); used += len(piece)
         return "\n".join(lines)
 
-    # top-k por config si no vino override
     from src.utils.logging import get_logger
     log = get_logger("rag.toolbox")
+
+    # top-k por config si no vino override (conserva tu lógica)
     try:
-        k_final = int(k) if k is not None else int((_retr.get("cfg") or {}).get("retrieval", {}).get("k", 8))  # fallback defensivo
+        k_final = int(k) if k is not None else int((_retr.get("cfg") or {}).get("retrieval", {}).get("k", 8))
     except Exception:
         k_final = 8
 
-    # construir retriever híbrido (si tu retriever acepta user_id, pásalo)
+    # Normalizar dominios: si None/[]/["*"] → usar todos
     try:
-        retr = _retr.get_ensemble_retriever(domains=domains, k_override=k_final, user_id=user_id)
+        cfg = _retr.get("cfg") or {}
+    except Exception:
+        cfg = {}
+    doms_req = (domains or [])
+    if not doms_req or doms_req == ["*"]:
+        doms_req = _all_domains(cfg)
+
+    # Construir retriever híbrido (respetando tu contrato)
+    try:
+        retr = _retr.get_ensemble_retriever(domains=doms_req, k_override=k_final, user_id=user_id)
     except Exception as e:
         log.error(f"rag_search: no se pudo construir el ensemble retriever: {e}")
         return {"results": [], "count": 0, "context_md": ""}
 
+    # 1) Vector / ensemble principal
     docs = _run_retriever(retr, query)
     payload = _pack_results(docs)
+    results: List[Dict[str, Any]] = payload.get("results", [])
+    count_before = len(results)
+
+    # 2) Completar con fallback lexical on-disk por dominio si falta para top-K
+    try:
+        # dedup por (source, text[:120])
+        seen = set(( (r.get("source") or ""), (r.get("text") or "")[:120]) for r in results)
+        if len(results) < k_final:
+            for dom in doms_req:
+                # si ya llenamos, cortamos
+                if len(results) >= k_final:
+                    break
+                fallback = _bm25_disk_search(query, dom, k=k_final)
+                for r in fallback:
+                    key = (r.get("source") or "", (r.get("text") or "")[:120])
+                    if key in seen:
+                        continue
+                    results.append(r)
+                    seen.add(key)
+                    if len(results) >= k_final:
+                        break
+        payload["results"] = results
+        payload["count"] = len(results)
+    except Exception as e:
+        log.warning(f"rag_search: fallback lexical on-disk fallo: {e}")
+
+    # 3) context_md y evidencia
     payload["context_md"] = _results_to_context_md(payload["results"])
 
-    # registrar evidencia, usando trace_id explícito o el contextvar actual
     tid = trace_id or get_current_trace_id()
     if payload["results"]:
         try:
@@ -269,10 +302,13 @@ def rag_search(
         except Exception:
             pass
 
-    log.debug(f"RAG({domains or '*'}) uid={user_id or '-'} trace={tid or '-'} '{query[:60]}…' → {payload['count']} pasajes")
-    
+    log.debug(
+        f"RAG({doms_req or '*'}) uid={user_id or '-'} trace={tid or '-'} "
+        f"'{query[:60]}…' → {payload['count']} pasajes (vec={count_before}, +lex={payload['count']-count_before})"
+    )
     inc(RAG_SEARCH_TOTAL)
     return payload
+
 # ---------------------------- Probe para Router -------------------------------
 
 def rag_probe_counts(query: str, domains: Optional[List[str]] = None, k: int = 3) -> Dict[str, int]:
@@ -295,4 +331,107 @@ def rag_probe_counts(query: str, domains: Optional[List[str]] = None, k: int = 3
             md = d.get("metadata") or {}
         dom = (md or {}).get("domain") or "general"
         counts[dom] = counts.get(dom, 0) + 1
+    return counts
+
+# === NUEVO: dominios desde docs.yaml ===
+def _all_domains(cfg: Optional[dict] = None) -> List[str]:
+    try:
+        # intentar desde cfg ya cargado
+        docs = (cfg or {}).get("docs") or {}
+        if docs:
+            return sorted([k for k, v in docs.items() if isinstance(v, list) and v])
+        # fallback: leer config/docs.yaml si existe
+        import yaml
+        p = Path("config/docs.yaml")
+        if p.exists():
+            y = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+            return sorted([k for k, v in (y or {}).items() if isinstance(v, list) and v])
+    except Exception:
+        pass
+    return ["general"]  # mínimo
+
+# === NUEVO: búsqueda lexical on-disk (fallback no-BM25) ===
+import json, re
+_WORD = re.compile(r"\w+", re.U)
+
+def _tokenize(q: str) -> List[str]:
+    return [w.lower() for w in _WORD.findall(q or "") if len(w) > 1]
+
+def _bm25_disk_search(query: str, domain: str, k: int = 5) -> List[Dict[str, Any]]:
+    """
+    Fallback lexical: lee cache/bm25/<dominio>.jsonl y rankea por coincidencia de tokens.
+    No requiere un BM25 en memoria; evita depender del refresh.
+    """
+    path = Path(f"cache/bm25/{domain}.jsonl")
+    if not path.exists():
+        return []
+    toks = set(_tokenize(query))
+    if not toks:
+        return []
+    results = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                txt = (rec.get("text") or "")
+                src = rec.get("source") or rec.get("path") or "unknown"
+                # score simple: conteo de tokens presentes
+                text_toks = set(_tokenize(txt))
+                score = len(toks & text_toks)
+                if score <= 0:
+                    continue
+                results.append({"text": txt, "source": src, "score": float(score), "domain": domain})
+    except Exception:
+        return []
+    # rankear por score desc, cortar k
+    results.sort(key=lambda r: r.get("score", 0.0), reverse=True)
+    return results[: max(1, int(k))]
+
+# === NUEVO: probe de hits por dominio ===
+def rag_probe_counts(query: str, domains: List[str], k: int = 5) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for dom in domains:
+        # intentar vector primero
+        try:
+            obs = rag_search.invoke({"query": query, "domains": [dom], "k": k}) or {}
+            cnt = len(obs.get("results") or [])
+        except Exception:
+            cnt = 0
+        # si no hay nada, fallback lexical on-disk
+        if cnt == 0:
+            cnt = len(_bm25_disk_search(query, dom, k))
+        counts[dom] = cnt
+    return counts
+
+def rag_probe_counts(
+    query: str,
+    domains: Optional[List[str]] = None,
+    k: int = 5,
+) -> Dict[str, int]:
+    """
+    Cuenta hits por dominio usando rag_search (con fallback on-disk).
+    - Si domains es None/[]/["*"], usa todos los dominios conocidos desde config/docs.yaml.
+    """
+    try:
+        cfg = _retr.get("cfg") or {}
+    except Exception:
+        cfg = {}
+
+    # Normalizar dominios
+    doms = domains or []
+    if not doms or doms == ["*"]:
+        doms = _all_domains(cfg)
+
+    counts: Dict[str, int] = {}
+    for dom in doms:
+        try:
+            obs = rag_search.invoke({"query": query, "domains": [dom], "k": k}) or {}
+            cnt = int(len(obs.get("results") or []))
+        except Exception:
+            # Último recurso: solo lexical disco
+            cnt = len(_bm25_disk_search(query, dom, k))
+        counts[dom] = cnt
     return counts
