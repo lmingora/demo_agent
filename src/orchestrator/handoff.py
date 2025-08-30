@@ -66,3 +66,4 @@ def log_handoff(handoff: Handoff, trace_id: Optional[str] = None, path: str = "c
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass
+##comentario 
